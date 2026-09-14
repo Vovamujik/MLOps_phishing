@@ -1,0 +1,90 @@
+[project]
+name = "mlops-phishing"
+version = "0.1.0"
+description = "MLOps-сервис обнаружения фишинговых сайтов по URL"
+readme = "README.md"
+authors = [
+    { name = "Vovamujik", email = "vovchikbar06@gmail.com" }
+]
+requires-python = ">=3.12"
+
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.30.0",
+    "pydantic-settings>=2.6.0",
+    "asyncpg>=0.30.0",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.11.0",
+    "pre-commit>=4.2.0",
+    "pytest>=8.3.0",
+    "pytest-asyncio>=0.25.0",
+    "pytest-cov>=6.0.0",
+    "httpx>=0.28.0",
+    "asgi-lifespan>=2.1.0",
+]
+
+[build-system]
+requires = ["uv_build>=0.12.13,<0.13.0"]
+build-backend = "uv_build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# auto: async-тесты не нужно помечать @pytest.mark.asyncio вручную
+asyncio_mode = "auto"
+addopts = "-q --cov --cov-report=term-missing --cov-report=xml"
+
+[tool.coverage.run]
+source = ["src/mlops_phishing"]
+# branch=true считает и ветвления (if/else), а не только выполненные строки
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+# Планка, ниже которой CI падает. Поднимем по мере роста тестов
+fail_under = 80
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E",     # pycodestyle errors
+    "W",     # pycodestyle warnings
+    "F",     # pyflakes: неиспользуемые импорты/переменные
+    "I",     # isort: порядок импортов
+    "UP",    # pyupgrade: устаревший синтаксис
+    "N",     # pep8-naming
+    "B",     # flake8-bugbear: типичные логические баги
+    "C4",    # flake8-comprehensions
+    "SIM",   # flake8-simplify
+    "ASYNC", # флаги блокирующих вызовов в async-коде
+    "FAST",  # специфичные для FastAPI: дублирование response_model и т.п.
+    "BLE",   # запрет голого except Exception
+    "ANN",   # обязательные аннотации типов
+    "RUF",   # правила самого ruff
+    "S",     # security проверки потенциально небезопасных конструкций, типа хардкоженные пароли итд
+]
+ignore = [
+    "RUF001", # кириллица в строках — ложные срабатывания
+    "RUF002", # кириллица в docstring
+    "RUF003", # кириллица в комментариях
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["ANN", "S101"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["mlops_phishing"]
+
+[tool.ruff.format]
+quote-style = "double"
