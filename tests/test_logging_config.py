@@ -58,7 +58,22 @@ def test_setup_logging_takes_over_uvicorn_loggers():
     setup_logging("INFO")
     root_handler = logging.getLogger().handlers[0]
 
-    for name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+    for name in ("uvicorn", "uvicorn.error"):
         uvicorn_logger = logging.getLogger(name)
         assert uvicorn_logger.handlers == [root_handler]
         assert uvicorn_logger.propagate is False
+
+
+def test_setup_logging_disables_uvicorn_access_log(monkeypatch):
+    """Access-лог uvicorn выключен: middleware пишет то же самое, но с request_id.
+
+    Флаг сначала явно сбрасывается: lifespan в других тестах уже вызывал
+    setup_logging, и без сброса тест прошёл бы, даже если бы настройка
+    перестала выключать логгер.
+    """
+    access_logger = logging.getLogger("uvicorn.access")
+    monkeypatch.setattr(access_logger, "disabled", False)
+
+    setup_logging("INFO")
+
+    assert access_logger.disabled is True

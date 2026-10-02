@@ -14,12 +14,31 @@ from starlette.responses import Response
 
 from mlops_phishing import db, logging_config
 from mlops_phishing.api.router import root_router
+from mlops_phishing.api.system import LIVENESS_PATH
 from mlops_phishing.config import get_settings
 from mlops_phishing.metadata import get_version
 
 log = logging.getLogger(__name__)
 
 REQUEST_ID_HEADER = "X-Request-ID"
+
+QUIET_PATHS = frozenset({LIVENESS_PATH})
+
+
+def access_log_level(path: str, status_code: int) -> int:
+    """Выбрать уровень записи о запросе.
+
+    Уровень зависит от ответа, чтобы проблемные запросы было видно сразу.
+    Тихие пути понижаются до DEBUG только при успехе: упавший healthcheck
+    должен быть так же заметен, как любая другая ошибка.
+    """
+    if status_code >= 500:
+        return logging.ERROR
+    if status_code >= 400:
+        return logging.WARNING
+    if path in QUIET_PATHS:
+        return logging.DEBUG
+    return logging.INFO
 
 
 @asynccontextmanager
@@ -70,15 +89,28 @@ def create_app() -> FastAPI:
         request_id = uuid.uuid4().hex[:8]
         token = logging_config.REQUEST_ID.set(request_id)
         started_at = time.perf_counter()
+        client = request.client.host if request.client else "-"
         try:
             response = await call_next(request)
-            elapsed_ms = (time.perf_counter() - started_at) * 1000
-            log.info(
-                "%s %s -> %d (%.1f ms)",
+        except Exception as exc:
+            log.error(
+                "%s %s -> 500 (%.1f ms) client=%s exception=%s",
+                request.method,
+                request.url.path,
+                (time.perf_counter() - started_at) * 1000,
+                client,
+                type(exc).__name__,
+            )
+            raise
+        else:
+            log.log(
+                access_log_level(request.url.path, response.status_code),
+                "%s %s -> %d (%.1f ms) client=%s",
                 request.method,
                 request.url.path,
                 response.status_code,
-                elapsed_ms,
+                (time.perf_counter() - started_at) * 1000,
+                client,
             )
         finally:
             logging_config.REQUEST_ID.reset(token)

@@ -1,6 +1,5 @@
 # syntax=docker/dockerfile:1
 
-# ---------- builder: ставим зависимости и сам пакет в /app/.venv ----------
 FROM python:3.12-slim AS builder
 
 COPY --from=ghcr.io/astral-sh/uv:0.12 /uv /bin/uv
@@ -11,18 +10,17 @@ ENV UV_COMPILE_BYTECODE=1 \
 
 WORKDIR /app
 
-# 1. Только зависимости: слой кэшируется, пока не меняется uv.lock
+# Только зависимости: слой кэшируется, пока не меняется uv.lock
 COPY pyproject.toml uv.lock ./
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-dev --no-install-project
 
-# 2. Код и сам пакет (non-editable: в образ уходит собранный пакет с METADATA)
+# Код и сам пакет
 COPY README.md ./
 COPY src/ ./src/
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-dev --no-editable
 
-# ---------- runtime: только venv, без uv и исходников ----------
 FROM python:3.12-slim AS runtime
 
 RUN useradd --create-home --uid 1000 appuser
@@ -43,7 +41,7 @@ ENV GIT_COMMIT=${GIT_COMMIT} \
 USER 1000:1000
 EXPOSE 8000
 
-# Liveness только через /healthz: он не ходит в БД
+# Liveness только через /healthz
 HEALTHCHECK --interval=10s --timeout=3s --start-period=10s --retries=3 \
     CMD ["python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=2).status == 200 else 1)"]
 

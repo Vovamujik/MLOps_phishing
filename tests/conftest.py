@@ -27,7 +27,7 @@ def read_pyproject_version() -> str:
         return tomllib.load(file)["project"]["version"]
 
 
-# Заведомо закрытый порт: попытка подключения падает сразу, а не ждёт таймаут
+# Заведомо закрытый порт попытка подключения падает сразу
 DEAD_DATABASE_URL = "postgresql://postgres:postgres@127.0.0.1:59999/mlops_phishing"
 
 POSTGRES_VERSION_RAW = "PostgreSQL 16.15 (Debian 16.15-1) on aarch64-unknown-linux-gnu, gcc"

@@ -50,7 +50,9 @@ def setup_logging(level: str) -> None:
     root.handlers = [handler]
     root.setLevel(level.upper())
 
-    for name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+    for name in ("uvicorn", "uvicorn.error"):
         uvicorn_logger = logging.getLogger(name)
         uvicorn_logger.handlers = [handler]
         uvicorn_logger.propagate = False
+
+    logging.getLogger("uvicorn.access").disabled = True
