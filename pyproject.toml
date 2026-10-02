@@ -34,7 +34,7 @@ build-backend = "uv_build"
 testpaths = ["tests"]
 # auto: async-тесты не нужно помечать @pytest.mark.asyncio вручную
 asyncio_mode = "auto"
-addopts = "-q --cov --cov-report=term-missing --cov-report=xml"
+addopts = "-q --cov --cov-report=term-missing"
 
 [tool.coverage.run]
 source = ["src/mlops_phishing"]

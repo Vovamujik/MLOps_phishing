@@ -44,11 +44,6 @@ jobs:
       - run: uv sync --frozen
       - name: Pytest (порог покрытия из pyproject роняет job)
         run: uv run pytest
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: coverage-xml
-          path: coverage.xml
 
   smoke:
     name: Docker compose smoke test

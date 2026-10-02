@@ -51,7 +51,7 @@ uv run pre-commit run --all-files
 | Job | Что делает |
 |---|---|
 | `lint` | `uv lock --check`, `ruff check`, `ruff format --check`, все хуки pre-commit |
-| `test` | pytest с покрытием (падает ниже 80%), `coverage.xml` сохраняется артефактом |
+| `test` | pytest с покрытием (падает ниже 80%) |
 | `smoke` | `docker compose up --wait`, запросы ко всем трём эндпоинтам на живом Postgres |
 
 ### CD — `.github/workflows/cd.yml`
