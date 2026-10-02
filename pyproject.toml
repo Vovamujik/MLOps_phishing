@@ -1,6 +1,6 @@
 [project]
 name = "mlops-phishing"
-version = "0.1.0"
+version = "0.1.1"
 description = "MLOps-сервис обнаружения фишинговых сайтов по URL"
 readme = "README.md"
 authors = [
