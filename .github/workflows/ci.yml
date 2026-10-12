@@ -51,16 +51,32 @@ jobs:
     needs: [lint, test]
     steps:
       - uses: actions/checkout@v7
-      - name: Build & start (app, postgres, MLflow stack)
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+      # Seed-скрипту нужен клиент MLflow и код обучения
+      - run: uv sync --frozen --group ml
+      - name: Start MLflow stack
+        # Запас на скачивание образа MLflow (~380 MB) и его миграции на первом старте
+        run: docker compose up -d --wait --wait-timeout 180 mlflow
+      - name: Register seed model as champion
+        # MLflow в CI пустой: без модели приложение стартует без неё и /process не проверить
+        run: uv run python -m training.seed_ci_model
+      - name: Build & start app
         env:
           GIT_COMMIT: ${{ github.sha }}
-        # Запас на скачивание образа MLflow (~380 MB) и его миграции на первом старте
         run: docker compose up -d --build --wait --wait-timeout 180
       - name: Check endpoints
+        # bash с pipefail: иначе падение curl в `curl | tee` не роняет шаг
+        shell: bash
         run: |
           curl -fsS http://localhost:8000/healthz
           curl -fsS http://localhost:8000/api/v1/version | tee version.json
           curl -fsS http://localhost:8000/api/v1/health
+          curl -fsS -X POST http://localhost:8000/api/v1/process \
+            -H 'Content-Type: application/json' \
+            -d '{"url": "http://paypal-secure-login.verify-account.xyz/signin"}' | tee process.json
+          python3 -c "import json; body = json.load(open('process.json')); assert body['model_version'] == '1', body"
       - name: Compose logs
         if: always()
         run: docker compose logs

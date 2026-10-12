@@ -84,7 +84,7 @@ def run_variant(name: str, variant: Variant, splits: Splits) -> None:
 
         log_diagnostics(model, splits.test, test_proba)
         # После метрик: MLflow копирует метрики рана в карточку модели
-        _log_model(model, splits.val[columns])
+        log_model(model, splits.val[columns])
 
 
 def _predict(model: Pipeline, part: pd.DataFrame, columns: list[str]) -> np.ndarray:
@@ -95,7 +95,7 @@ def _prefixed(prefix: str, metrics: dict[str, float]) -> dict[str, float]:
     return {f"{prefix}_{key}": value for key, value in metrics.items()}
 
 
-def _log_model(model: Pipeline, sample: pd.DataFrame) -> None:
+def log_model(model: Pipeline, sample: pd.DataFrame) -> None:
     sample = sample.head(100)
     signature = infer_signature(sample, model.predict_proba(sample))
     mlflow.sklearn.log_model(

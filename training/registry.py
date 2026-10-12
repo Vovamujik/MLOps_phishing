@@ -33,14 +33,17 @@ def register(run_id: str) -> ModelVersion:
     version = mlflow.register_model(f"models:/{models[0].model_id}", MODEL_NAME)
 
     client = MlflowClient()
+    metrics = run.data.metrics
     tags = {
-        "variant": run.data.tags.get("variant", ""),
-        "val_pr_auc": f"{run.data.metrics['val_pr_auc']:.4f}",
-        "git_commit": run.data.tags.get("mlflow.source.git.commit", ""),
-        "dataset_sha256": run.data.params.get("dataset_sha256", ""),
+        "variant": run.data.tags.get("variant"),
+        "val_pr_auc": f"{metrics['val_pr_auc']:.4f}" if "val_pr_auc" in metrics else None,
+        "git_commit": run.data.tags.get("mlflow.source.git.commit"),
+        "dataset_sha256": run.data.params.get("dataset_sha256"),
     }
+    # У seed-модели для CI нет метрик и датасета: пустые теги не пишем
     for key, value in tags.items():
-        client.set_model_version_tag(MODEL_NAME, version.version, key, value)
+        if value:
+            client.set_model_version_tag(MODEL_NAME, version.version, key, value)
     client.update_registered_model(MODEL_NAME, description=DESCRIPTION)
     return version
 
