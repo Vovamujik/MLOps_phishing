@@ -51,18 +51,19 @@ jobs:
     needs: [lint, test]
     steps:
       - uses: actions/checkout@v7
-      - name: Build & start (app + postgres)
+      - name: Build & start (app, postgres, MLflow stack)
         env:
           GIT_COMMIT: ${{ github.sha }}
-        run: docker compose up -d --build --wait --wait-timeout 120
+        # Запас на скачивание образа MLflow (~380 MB) и его миграции на первом старте
+        run: docker compose up -d --build --wait --wait-timeout 180
       - name: Check endpoints
         run: |
           curl -fsS http://localhost:8000/healthz
           curl -fsS http://localhost:8000/api/v1/version | tee version.json
           curl -fsS http://localhost:8000/api/v1/health
-      - name: App logs
+      - name: Compose logs
         if: always()
-        run: docker compose logs app
+        run: docker compose logs
       - name: Tear down
         if: always()
         run: docker compose down -v

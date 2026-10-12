@@ -45,5 +45,102 @@ services:
         condition: service_healthy
     logging: *default-logging
 
+  mlflow-db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${MLFLOW_DB_USER:-mlflow}
+      POSTGRES_PASSWORD: ${MLFLOW_DB_PASSWORD:-mlflow}
+      POSTGRES_DB: ${MLFLOW_DB_NAME:-mlflow}
+    volumes:
+      - mlflow_db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    logging: *default-logging
+
+  # MLflow Artifact Store: S3-совместимое хранилище файлов (графики, модели)
+  s3:
+    image: rustfs/rustfs:1.0.1
+    restart: unless-stopped
+    environment:
+      RUSTFS_ACCESS_KEY: ${S3_ACCESS_KEY:-mlflow}
+      RUSTFS_SECRET_KEY: ${S3_SECRET_KEY:-mlflow-secret}
+      RUSTFS_SERVER_DOMAINS: s3:9000
+      RUSTFS_CONSOLE_ENABLE: "true"
+    ports:
+      - "9001:9001" # веб-консоль: посмотреть файлы в бакете
+    volumes:
+      - s3_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9000/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    logging: *default-logging
+
+  # Одноразово создаёт бакет и завершается
+  s3-init:
+    image: amazon/aws-cli:2.33.25
+    restart: "no"
+    environment:
+      AWS_ACCESS_KEY_ID: ${S3_ACCESS_KEY:-mlflow}
+      AWS_SECRET_ACCESS_KEY: ${S3_SECRET_KEY:-mlflow-secret}
+      AWS_DEFAULT_REGION: us-east-1
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        aws --endpoint-url http://s3:9000 s3api head-bucket --bucket mlflow
+        || aws --endpoint-url http://s3:9000 s3api create-bucket --bucket mlflow
+    depends_on:
+      s3:
+        condition: service_healthy
+    logging: *default-logging
+
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v3.17.0-full
+    restart: unless-stopped
+    # Файлы клиенты отдают серверу, а он кладёт их в s3, ключи от хранилища есть только здесь
+    command:
+      - mlflow
+      - server
+      - --backend-store-uri
+      - postgresql://${MLFLOW_DB_USER:-mlflow}:${MLFLOW_DB_PASSWORD:-mlflow}@mlflow-db:5432/${MLFLOW_DB_NAME:-mlflow}
+      - --artifacts-destination
+      - s3://mlflow
+      - --host
+      - 0.0.0.0
+      - --port
+      - "5000"
+      - --workers
+      - "2"
+    environment:
+      MLFLOW_S3_ENDPOINT_URL: http://s3:9000
+      AWS_ACCESS_KEY_ID: ${S3_ACCESS_KEY:-mlflow}
+      AWS_SECRET_ACCESS_KEY: ${S3_SECRET_KEY:-mlflow-secret}
+      AWS_DEFAULT_REGION: us-east-1
+      MLFLOW_SERVER_ALLOWED_HOSTS: mlflow:*,localhost:*,127.0.0.1:*
+      MLFLOW_DISABLE_TELEMETRY: "true"
+    ports:
+      - "5050:5000" # 5000 на macOS занят AirPlay
+    depends_on:
+      mlflow-db:
+        condition: service_healthy
+      s3-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    logging: *default-logging
+
 volumes:
   postgres_data:
+  mlflow_db_data:
+  s3_data:
