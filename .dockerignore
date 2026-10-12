@@ -12,3 +12,7 @@ htmlcov
 tests
 .pre-commit-config.yaml
 docker-compose.yml
+data
+mlruns
+mlartifacts
+mlflow.db

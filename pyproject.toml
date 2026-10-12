@@ -13,6 +13,10 @@ dependencies = [
     "uvicorn[standard]>=0.30.0",
     "pydantic-settings>=2.6.0",
     "asyncpg>=0.30.0",
+    "mlflow-skinny==3.17.0",
+    "scikit-learn>=1.7",
+    "pandas>=2.2",
+    "skops>=0.13",
 ]
 
 [dependency-groups]
@@ -24,6 +28,12 @@ dev = [
     "pytest-cov>=6.0.0",
     "httpx>=0.28.0",
     "asgi-lifespan>=2.1.0",
+]
+# Обучение и EDA на ноутбуке, в образ не попадает
+ml = [
+    "mlflow==3.17.0",
+    "matplotlib>=3.9",
+    "certifi>=2024.0.0",
 ]
 
 [build-system]
