@@ -6,7 +6,7 @@ from mlops_phishing.config import Settings
 from mlops_phishing.schemas import ComponentStatus, ReportStatus
 from mlops_phishing.services import health as health_service
 
-from .conftest import POSTGRES_VERSION_RAW, FakePool
+from .conftest import POSTGRES_VERSION_RAW, FakePool, make_model
 
 
 def test_parse_version_extracts_product_and_number():
@@ -82,7 +82,7 @@ async def test_run_check_measures_latency_even_on_failure():
 
 async def test_build_report_is_ok_when_every_component_is_healthy():
     """Все зависимости здоровы — общий статус ok, версии на месте."""
-    report = await health_service.build_report(FakePool(), Settings())
+    report = await health_service.build_report(FakePool(), make_model(), Settings())
 
     assert report.status is ReportStatus.ok
     assert report.environment == "development"
@@ -92,10 +92,41 @@ async def test_build_report_is_ok_when_every_component_is_healthy():
 
 async def test_build_report_degrades_when_component_is_down():
     """Одна нездоровая зависимость роняет общий статус до degraded."""
-    report = await health_service.build_report(FakePool(error=OSError("down")), Settings())
+    report = await health_service.build_report(
+        FakePool(error=OSError("down")), make_model(), Settings()
+    )
 
     assert report.status is ReportStatus.degraded
     assert report.components["postgres"].status is ComponentStatus.unavailable
+
+
+async def test_model_component_shows_loaded_version():
+    """Версия модели в отчёте — та, что загружена при старте."""
+    component = await health_service.run_check(
+        health_service.read_model_version(make_model(version="7")), limit_seconds=1.0
+    )
+
+    assert component.status is ComponentStatus.healthy
+    assert component.version == "phishing-url-clf v7 (@champion)"
+
+
+async def test_missing_model_is_unavailable_not_a_crash():
+    """Незагруженная модель — штатный отказ компонента, а не 500 у health."""
+    component = await health_service.run_check(
+        health_service.read_model_version(None), limit_seconds=1.0
+    )
+
+    assert component.status is ComponentStatus.unavailable
+    assert "ModelUnavailableError" in component.error
+
+
+async def test_build_report_degrades_without_model():
+    """Без модели сервис не может выполнять свою работу, поэтому degraded."""
+    report = await health_service.build_report(FakePool(), None, Settings())
+
+    assert report.status is ReportStatus.degraded
+    assert report.components["postgres"].status is ComponentStatus.healthy
+    assert report.components["model"].status is ComponentStatus.unavailable
 
 
 async def test_checks_run_concurrently_not_sequentially():

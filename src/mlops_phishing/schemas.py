@@ -6,7 +6,7 @@
 
 from enum import StrEnum
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class LivenessResponse(BaseModel):
@@ -57,3 +57,29 @@ class HealthReport(BaseModel):
     environment: str = Field(description="Окружение: development / staging / production.")
     total_latency_ms: float = Field(description="Полное время сбора отчёта, миллисекунды.")
     components: dict[str, ComponentHealth] = Field(description="Состояние каждой зависимости.")
+
+
+class ProcessRequest(BaseModel):
+    """Тело `POST /api/v1/process`: URL, который нужно проверить."""
+
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    url: str = Field(
+        min_length=1,
+        max_length=2048,
+        pattern=r"(?i)^https?://\S+$",
+        description="Полный URL со схемой http или https. Сервис его не открывает.",
+        examples=["http://paypal-secure-login.verify-account.xyz/signin"],
+    )
+
+
+class ProcessResponse(BaseModel):
+    """Ответ `POST /api/v1/process`: вердикт и модель, которая его дала."""
+
+    url: str
+    is_phishing: bool = Field(description="Вероятность фишинга не ниже порога.")
+    phishing_probability: float = Field(description="Вероятность фишинга от 0 до 1.")
+    threshold: float = Field(description="Порог, с которым сравнивалась вероятность.")
+    model_name: str = Field(description="Имя модели в MLflow Model Registry.")
+    model_version: str = Field(description="Версия модели, загруженная при старте.")
+    model_alias: str = Field(description="Alias, по которому версия выбрана.")

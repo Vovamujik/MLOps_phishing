@@ -12,7 +12,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from starlette.responses import Response
 
-from mlops_phishing import db, logging_config
+from mlops_phishing import db, logging_config, ml
 from mlops_phishing.api.router import root_router
 from mlops_phishing.api.system import LIVENESS_PATH
 from mlops_phishing.config import get_settings
@@ -43,7 +43,7 @@ def access_log_level(path: str, status_code: int) -> int:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
-    """Жизненный цикл: поднять пул БД при старте, закрыть при остановке.
+    """Жизненный цикл: при старте поднять пул БД и загрузить модель, при остановке закрыть пул.
 
     Ресурсы создаются здесь, а не на уровне модуля: при импорте ещё нет
     работающего event loop, а тесты должны уметь поднимать и гасить
@@ -54,6 +54,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
 
     app.state.settings = settings
     app.state.db_pool = await db.create_pool(settings)
+    app.state.model = await ml.load_model_or_none(settings)
 
     log.info(
         "Приложение %s v%s запущено (environment=%s, debug=%s)",

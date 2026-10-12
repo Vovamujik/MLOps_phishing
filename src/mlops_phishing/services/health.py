@@ -17,11 +17,15 @@ from time import perf_counter
 from mlops_phishing.config import Settings
 from mlops_phishing.db import DEPENDENCY_ERRORS, DatabasePool
 from mlops_phishing.metadata import get_version
+from mlops_phishing.ml import LoadedModel, ModelUnavailableError
 from mlops_phishing.schemas import ComponentHealth, ComponentStatus, HealthReport, ReportStatus
 
 log = logging.getLogger(__name__)
 
 POSTGRES_VERSION_QUERY = "SELECT version()"
+
+# Отказы, которые превращаются в статус unavailable, а не в 500
+CHECK_ERRORS = (*DEPENDENCY_ERRORS, ModelUnavailableError)
 
 
 def elapsed_ms(started_at: float) -> float:
@@ -41,6 +45,13 @@ async def read_postgres_version(pool: DatabasePool) -> str:
     return parse_postgres_version(str(raw))
 
 
+async def read_model_version(model: LoadedModel | None) -> str:
+    """Версия модели, загруженной при старте. Модель уже в памяти, в сеть не ходим."""
+    if model is None:
+        raise ModelUnavailableError("модель не загружена при старте, причина в логе")
+    return f"{model.name} v{model.version} (@{model.alias})"
+
+
 async def run_check(probe: Awaitable[str], limit_seconds: float) -> ComponentHealth:
     """Выполнить проверку под таймаутом, замерив время ответа.
 
@@ -52,7 +63,7 @@ async def run_check(probe: Awaitable[str], limit_seconds: float) -> ComponentHea
     try:
         async with asyncio.timeout(limit_seconds):
             version = await probe
-    except DEPENDENCY_ERRORS as exc:
+    except CHECK_ERRORS as exc:
         log.warning("Компонент недоступен: %s: %s", type(exc).__name__, exc)
         return ComponentHealth(
             status=ComponentStatus.unavailable,
@@ -67,7 +78,9 @@ async def run_check(probe: Awaitable[str], limit_seconds: float) -> ComponentHea
     )
 
 
-async def build_report(pool: DatabasePool, settings: Settings) -> HealthReport:
+async def build_report(
+    pool: DatabasePool, model: LoadedModel | None, settings: Settings
+) -> HealthReport:
     """Собрать отчёт по всем third-party компонентам.
 
     `asyncio.gather` запускает проверки параллельно: добавление пятой
@@ -77,6 +90,7 @@ async def build_report(pool: DatabasePool, settings: Settings) -> HealthReport:
     """
     checks: dict[str, Awaitable[str]] = {
         "postgres": read_postgres_version(pool),
+        "model": read_model_version(model),
     }
 
     started_at = perf_counter()

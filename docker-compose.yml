@@ -38,10 +38,16 @@ services:
       DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-mlops_phishing}
       ENVIRONMENT: ${ENVIRONMENT:-development}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      MODEL_NAME: ${MODEL_NAME:-phishing-url-clf}
+      MODEL_ALIAS: ${MODEL_ALIAS:-champion}
+      MLFLOW_DISABLE_TELEMETRY: "true"
     ports:
       - "8000:8000"
     depends_on:
       postgres:
+        condition: service_healthy
+      mlflow:
         condition: service_healthy
     logging: *default-logging
 

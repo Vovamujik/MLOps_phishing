@@ -1,0 +1,129 @@
+"""Модель из MLflow Model Registry: загрузка при старте и предсказание.
+
+Приложение знает только имя модели и alias. Какая версия стоит за alias, решает
+реестр: переставили alias, перезапустили приложение, и обслуживается другая
+версия без правки кода.
+"""
+
+import asyncio
+import logging
+import os
+import tempfile
+import time
+from dataclasses import dataclass
+from typing import Protocol
+
+import mlflow.sklearn
+import numpy as np
+import pandas as pd
+from mlflow import MlflowClient
+from mlflow.exceptions import MlflowException
+
+from mlops_phishing.config import Settings
+
+log = logging.getLogger(__name__)
+
+INPUT_COLUMN = "URL"
+
+
+class Classifier(Protocol):
+    """Всё, что приложению нужно от модели: вероятности классов."""
+
+    def predict_proba(self, x: pd.DataFrame) -> np.ndarray:
+        """Вернуть массив (n, 2): вероятности легитимного сайта и фишинга."""
+        ...
+
+
+@dataclass(frozen=True)
+class LoadedModel:
+    """Загруженная модель и её происхождение в реестре."""
+
+    name: str
+    version: str
+    alias: str
+    run_id: str
+    classifier: Classifier
+
+    def phishing_probability(self, url: str) -> float:
+        """Вероятность фишинга для одного URL. Блокирует: это CPU-работа sklearn."""
+        frame = pd.DataFrame({INPUT_COLUMN: [url]})
+        return float(self.classifier.predict_proba(frame)[0, 1])
+
+
+class ModelUnavailableError(RuntimeError):
+    """Модель не загрузилась при старте приложения."""
+
+
+def load_model(settings: Settings) -> LoadedModel:
+    """Загрузить версию, на которую указывает alias. Блокирует: сеть и диск.
+
+    Alias разрешается в номер версии один раз, и грузится именно эта версия.
+    Если загрузить `@alias` вторым запросом, alias может переехать между ними,
+    и приложение покажет не ту версию, что загрузило.
+    """
+    configure_mlflow_client(settings)
+    version = MlflowClient().get_model_version_by_alias(settings.model_name, settings.model_alias)
+    # Через REST номер версии — строка, из SQL-хранилища — int
+    number = str(version.version)
+    # Файлы модели нужны только на время десериализации, дальше она живёт в памяти
+    with tempfile.TemporaryDirectory() as tmp:
+        classifier = mlflow.sklearn.load_model(
+            f"models:/{settings.model_name}/{number}", dst_path=tmp
+        )
+    return LoadedModel(
+        name=settings.model_name,
+        version=number,
+        alias=settings.model_alias,
+        run_id=version.run_id,
+        classifier=classifier,
+    )
+
+
+def configure_mlflow_client(settings: Settings) -> None:
+    """Настроить клиент MLflow одинаково в compose и при локальном запуске.
+
+    Переменные окружения, если заданы, важнее значений по умолчанию.
+    """
+    mlflow.set_tracking_uri(settings.mlflow_tracking_uri)
+    # Лежащий MLflow не держит старт минутами: по умолчанию 7 попыток, около 4 минут
+    os.environ.setdefault("MLFLOW_HTTP_REQUEST_MAX_RETRIES", "2")
+    os.environ.setdefault("MLFLOW_HTTP_REQUEST_TIMEOUT", "10")
+    # Файлы модели идут через сервер MLflow, а не напрямую из s3, который виден только в compose
+    os.environ.setdefault("MLFLOW_ENABLE_PROXY_MULTIPART_DOWNLOAD", "false")
+
+
+async def load_model_or_none(settings: Settings) -> LoadedModel | None:
+    """Загрузить модель при старте. Если загрузить не вышло, вернуть None.
+
+    Приложение стартует и без модели: /process отвечает 503, health показывает
+    отказ. Иначе пустой реестр, лежащий MLflow или битый артефакт роняли бы
+    контейнер в рестарт-луп. В отдельном потоке, чтобы не держать event loop.
+    """
+    started_at = time.perf_counter()
+    try:
+        model = await asyncio.to_thread(load_model, settings)
+    except (MlflowException, OSError) as exc:
+        log.error(
+            "Модель %s@%s не загружена: %s: %s",
+            settings.model_name,
+            settings.model_alias,
+            type(exc).__name__,
+            exc,
+        )
+        return None
+    except Exception:
+        # Артефакт скачался, но не читается: повреждён или от другой версии sklearn
+        log.exception(
+            "Модель %s@%s не десериализовалась", settings.model_name, settings.model_alias
+        )
+        return None
+
+    log.info(
+        "Модель загружена: %s v%s (@%s, run %s) за %.1f с",
+        model.name,
+        model.version,
+        model.alias,
+        model.run_id,
+        time.perf_counter() - started_at,
+    )
+    return model

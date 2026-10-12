@@ -43,6 +43,22 @@ class Settings(BaseSettings):
         description="Таймаут одной проверки зависимости в /api/v1/health, секунды.",
     )
 
+    mlflow_tracking_uri: str = Field(
+        default="http://localhost:5050",
+        description="Адрес MLflow, из реестра которого модель загружается при старте.",
+    )
+    model_name: str = Field(default="phishing-url-clf", description="Имя модели в реестре.")
+    model_alias: str = Field(
+        default="champion",
+        description="Alias версии, которую обслуживает приложение. Смена — без правки кода.",
+    )
+    phishing_threshold: float = Field(
+        default=0.5,
+        ge=0,
+        le=1,
+        description="Порог вероятности, начиная с которого URL считается фишингом.",
+    )
+
 
 @cache
 def get_settings() -> Settings:

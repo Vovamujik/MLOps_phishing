@@ -2,10 +2,13 @@
 
 import asyncio
 import logging
+import threading
 import tomllib
 from collections.abc import AsyncIterator, Callable, Iterator
 from pathlib import Path
 
+import numpy as np
+import pandas as pd
 import pytest
 from asgi_lifespan import LifespanManager
 from httpx import ASGITransport, AsyncClient
@@ -13,6 +16,7 @@ from httpx import ASGITransport, AsyncClient
 from mlops_phishing.app import app
 from mlops_phishing.config import Settings, get_settings
 from mlops_phishing.metadata import get_version
+from mlops_phishing.ml import LoadedModel
 
 PYPROJECT = Path(__file__).resolve().parents[1] / "pyproject.toml"
 
@@ -29,6 +33,7 @@ def read_pyproject_version() -> str:
 
 # Заведомо закрытый порт попытка подключения падает сразу
 DEAD_DATABASE_URL = "postgresql://postgres:postgres@127.0.0.1:59999/mlops_phishing"
+DEAD_MLFLOW_URI = "http://127.0.0.1:59998"
 
 POSTGRES_VERSION_RAW = "PostgreSQL 16.15 (Debian 16.15-1) on aarch64-unknown-linux-gnu, gcc"
 
@@ -61,6 +66,33 @@ class FakePool:
     async def close(self) -> None:
         """Повторить контракт настоящего пула: его закрывает shutdown-фаза lifespan."""
         self.closed = True
+
+
+class FakeClassifier:
+    """Заглушка sklearn-модели: отдаёт заданную вероятность фишинга и запоминает вызовы."""
+
+    def __init__(self, phishing_probability: float = 0.9) -> None:
+        self.phishing_probability = phishing_probability
+        self.frames: list[pd.DataFrame] = []
+        self.thread_ids: list[int] = []
+
+    def predict_proba(self, x: pd.DataFrame) -> np.ndarray:
+        """Вернуть [легит, фишинг] для каждой строки и запомнить вход и поток."""
+        self.frames.append(x)
+        self.thread_ids.append(threading.get_ident())
+        p = self.phishing_probability
+        return np.array([[1 - p, p]] * len(x))
+
+
+def make_model(classifier: FakeClassifier | None = None, version: str = "3") -> LoadedModel:
+    """Модель, как будто загруженная из реестра."""
+    return LoadedModel(
+        name="phishing-url-clf",
+        version=version,
+        alias="champion",
+        run_id="run-123",
+        classifier=classifier or FakeClassifier(),
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -101,6 +133,8 @@ async def client(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[AsyncClient]:
     `ASGITransport` вызывает приложение напрямую, без сокета и порта.
     """
     monkeypatch.setenv("DATABASE_URL", DEAD_DATABASE_URL)
+    monkeypatch.setenv("MLFLOW_TRACKING_URI", DEAD_MLFLOW_URI)
+    monkeypatch.setenv("MLFLOW_HTTP_REQUEST_MAX_RETRIES", "0")
     get_settings.cache_clear()
 
     async with LifespanManager(app):
@@ -116,5 +150,16 @@ def install_pool(monkeypatch: pytest.MonkeyPatch) -> Callable[[FakePool], FakePo
     def _install(pool: FakePool) -> FakePool:
         monkeypatch.setattr(app.state, "db_pool", pool, raising=False)
         return pool
+
+    return _install
+
+
+@pytest.fixture
+def install_model(monkeypatch: pytest.MonkeyPatch) -> Callable[[LoadedModel], LoadedModel]:
+    """Подменить загруженную модель в состоянии приложения."""
+
+    def _install(model: LoadedModel) -> LoadedModel:
+        monkeypatch.setattr(app.state, "model", model, raising=False)
+        return model
 
     return _install

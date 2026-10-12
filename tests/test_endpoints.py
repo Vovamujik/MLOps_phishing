@@ -2,7 +2,7 @@
 
 from mlops_phishing.metadata import UNKNOWN
 
-from .conftest import FakePool, read_pyproject_version
+from .conftest import FakePool, make_model, read_pyproject_version
 
 # --- GET /healthz --------------------------------------------------------
 
@@ -96,11 +96,16 @@ async def test_health_returns_503_when_dependency_is_down(client):
     assert body["status"] == "degraded"
     assert body["components"]["postgres"]["status"] == "unavailable"
     assert body["components"]["postgres"]["error"]
+    # MLflow в тестах тоже недоступен, поэтому модель не загрузилась
+    assert body["components"]["model"]["status"] == "unavailable"
 
 
-async def test_health_returns_versions_and_latency_of_components(client, install_pool):
+async def test_health_returns_versions_and_latency_of_components(
+    client, install_pool, install_model
+):
     """Основное требование: версия каждого third-party и время его ответа."""
     install_pool(FakePool())
+    install_model(make_model(version="3"))
 
     response = await client.get("/api/v1/health")
     body = response.json()
@@ -117,15 +122,16 @@ async def test_health_returns_versions_and_latency_of_components(client, install
     assert postgres["latency_ms"] >= 0
     assert postgres["error"] is None
 
+    model = body["components"]["model"]
+    assert model["status"] == "healthy"
+    assert model["version"] == "phishing-url-clf v3 (@champion)"
+
 
 async def test_health_reports_latency_even_for_failed_component(client):
     """Время ожидания отказа тоже попадает в отчёт."""
     body = (await client.get("/api/v1/health")).json()
 
     assert body["components"]["postgres"]["latency_ms"] >= 0
-
-
-# Сквозные свойства
 
 
 async def test_every_response_carries_request_id(client):

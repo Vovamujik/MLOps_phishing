@@ -8,13 +8,14 @@
 from fastapi import APIRouter
 
 from mlops_phishing.api import system
-from mlops_phishing.api.v1 import health, version
+from mlops_phishing.api.v1 import health, process, version
 
 API_V1_PREFIX = "/api/v1"
 
 v1_router = APIRouter(prefix=API_V1_PREFIX)
 v1_router.include_router(version.router)
 v1_router.include_router(health.router)
+v1_router.include_router(process.router)
 
 root_router = APIRouter()
 root_router.include_router(system.router)
