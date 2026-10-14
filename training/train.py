@@ -19,7 +19,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import FunctionTransformer
 
-from mlops_phishing.features import normalize_urls, url_features
+from mlops_phishing.features import extract_hosts, normalize_urls, url_features
 from training.data import SEED, TARGET, Splits, load_dataset, log_splits, split_by_domain
 from training.evaluation import THRESHOLD, compute_metrics, log_diagnostics
 from training.tracking import setup_mlflow
@@ -41,9 +41,24 @@ def normalized_tfidf_logreg(ngram_min: int, ngram_max: int, min_df: int, c: floa
     В датасете все легитимные URL начинаются с https://www. и не имеют пути,
     и без нормализации модель учит этот формат, а не признаки фишинга.
     """
+    return _preprocessed_tfidf_logreg(normalize_urls, ngram_min, ngram_max, min_df, c)
+
+
+def host_tfidf_logreg(ngram_min: int, ngram_max: int, min_df: int, c: float) -> Pipeline:
+    """Как normalized_tfidf_logreg, но TF-IDF только по хосту, без пути и query.
+
+    Путь в датасете есть только у фишинга, и по нему модель считала фишингом
+    любой URL с путём, например github.com/mlflow/mlflow.
+    """
+    return _preprocessed_tfidf_logreg(extract_hosts, ngram_min, ngram_max, min_df, c)
+
+
+def _preprocessed_tfidf_logreg(
+    preprocess: Callable[..., np.ndarray], ngram_min: int, ngram_max: int, min_df: int, c: float
+) -> Pipeline:
     url = Pipeline(
         [
-            ("normalize", FunctionTransformer(normalize_urls, feature_names_out="one-to-one")),
+            ("normalize", FunctionTransformer(preprocess, feature_names_out="one-to-one")),
             ("tfidf", _tfidf(ngram_min, ngram_max, min_df)),
         ]
     )
@@ -104,6 +119,12 @@ VARIANTS: dict[str, Variant] = {
         normalized_tfidf_logreg,
         {"ngram_min": 3, "ngram_max": 5, "min_df": 10, "c": 1.0},
         skops_trusted_types=("mlops_phishing.features.normalize_urls",),
+    ),
+    # Те же параметры, что у normalized: вместо всего URL только хост
+    "host-only": Variant(
+        host_tfidf_logreg,
+        {"ngram_min": 3, "ngram_max": 5, "min_df": 10, "c": 1.0},
+        skops_trusted_types=("mlops_phishing.features.extract_hosts",),
     ),
     "handcrafted": Variant(
         handcrafted_hgb,
