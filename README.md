@@ -1,7 +1,9 @@
 # MLOps Phishing Detector
 
 Асинхронный FastAPI-сервис обнаружения фишинговых сайтов по URL
-(датасет PhiUSIIL, UCI). Текущий этап: инфраструктурный каркас.
+(датасет PhiUSIIL, UCI). Модель берётся из MLflow Model Registry
+(`phishing-url-clf@champion`) и загружается один раз при старте, подробнее —
+в разделе [MLflow](#mlflow).
 
 ## Быстрый старт
 
@@ -24,6 +26,7 @@ curl localhost:8000/api/v1/health
 | GET | `/healthz` | liveness-проба: процесс жив. Не версионируется и не ходит в БД |
 | GET | `/api/v1/version` | версия из метаданных пакета, git-коммит и время сборки образа |
 | GET | `/api/v1/health` | версии и `latency_ms` зависимостей; 200 или 503 |
+| POST | `/api/v1/process` | `{"url"}` → вероятность фишинга и версия модели; 503, если модель не загружена |
 
 ## Проверки
 
@@ -52,7 +55,7 @@ uv run pre-commit run --all-files
 |---|---|
 | `lint` | `uv lock --check`, `ruff check`, `ruff format --check`, все хуки pre-commit |
 | `test` | pytest с покрытием (падает ниже 80%) |
-| `smoke` | `docker compose up --wait`, запросы ко всем трём эндпоинтам на живом Postgres |
+| `smoke` | поднимает MLflow, регистрирует игрушечную seed-модель как `@champion`, `docker compose up --wait`, запросы ко всем эндпоинтам на живом Postgres и проверка, что `/process` отвечает версией 1 |
 
 ### CD — `.github/workflows/cd.yml`
 
