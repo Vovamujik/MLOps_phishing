@@ -13,13 +13,14 @@ import numpy as np
 import pandas as pd
 from mlflow.models import infer_signature
 from sklearn.compose import ColumnTransformer
+from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import FunctionTransformer
 
-from mlops_phishing.features import normalize_urls
-from training.data import TARGET, Splits, load_dataset, log_splits, split_by_domain
+from mlops_phishing.features import normalize_urls, url_features
+from training.data import SEED, TARGET, Splits, load_dataset, log_splits, split_by_domain
 from training.evaluation import THRESHOLD, compute_metrics, log_diagnostics
 from training.tracking import setup_mlflow
 
@@ -68,6 +69,24 @@ def _url_logreg(url_features: TfidfVectorizer | Pipeline, c: float) -> Pipeline:
     )
 
 
+def handcrafted_hgb(learning_rate: float, max_iter: int, max_leaf_nodes: int) -> Pipeline:
+    """Свои признаки URL (длина, доли символов, поддомены, IP, слова), затем бустинг."""
+    return Pipeline(
+        [
+            ("features", FunctionTransformer(url_features)),
+            (
+                "classifier",
+                HistGradientBoostingClassifier(
+                    learning_rate=learning_rate,
+                    max_iter=max_iter,
+                    max_leaf_nodes=max_leaf_nodes,
+                    random_state=SEED,
+                ),
+            ),
+        ]
+    )
+
+
 @dataclass(frozen=True)
 class Variant:
     build: Callable[..., Pipeline]
@@ -85,6 +104,15 @@ VARIANTS: dict[str, Variant] = {
         normalized_tfidf_logreg,
         {"ngram_min": 3, "ngram_max": 5, "min_df": 10, "c": 1.0},
         skops_trusted_types=("mlops_phishing.features.normalize_urls",),
+    ),
+    "handcrafted": Variant(
+        handcrafted_hgb,
+        {"learning_rate": 0.1, "max_iter": 300, "max_leaf_nodes": 31},
+        # Деревья HGB skops считает недоверенными; модель обучаем сами, источнику доверяем
+        skops_trusted_types=(
+            "mlops_phishing.features.url_features",
+            "sklearn.ensemble._hist_gradient_boosting.predictor.TreePredictor",
+        ),
     ),
 }
 
