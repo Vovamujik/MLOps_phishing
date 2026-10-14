@@ -156,16 +156,24 @@ uv run python -m training.registry show
 
 docker compose up -d --build app              # пересобрать: в образе нужен features.py
 curl -s -X POST localhost:8000/api/v1/process -H 'Content-Type: application/json' \
-  -d '{"url": "https://www.google.com"}'
+  -d '{"url": "https://secure-login-paypal.example.com/verify/account"}'
 ```
 
 Приложение при старте один раз разрешает `phishing-url-clf@champion` в номер
-версии и загружает её. Ответ (здесь `@champion` → v1):
+версии и загружает её. Ответ при `@champion` → v2 (`normalized`) на запрос
+`{"url": "https://secure-login-paypal.example.com/verify/account"}`:
 
 ```json
-{"url":"https://www.google.com","is_phishing":false,"phishing_probability":0.0006,
- "threshold":0.5,"model_name":"phishing-url-clf","model_version":"1","model_alias":"champion"}
+{"url":"https://secure-login-paypal.example.com/verify/account","is_phishing":true,
+ "phishing_probability":0.9979,"threshold":0.5,"model_name":"phishing-url-clf",
+ "model_version":"2","model_alias":"champion"}
 ```
+
+Переключение версии без правки кода: `registry alias champion 1` и
+`docker compose restart app` (без пересборки) — в логе старта
+`Модель загружена: phishing-url-clf v1`, `/process` отвечает
+`"model_version":"1"`. `registry alias champion 2` и ещё один рестарт
+возвращают v2. Версия меняется только при старте приложения.
 
 Модели `normalized` и `host-only` ссылаются на функции из
 `src/mlops_phishing/features.py`. Со старым образом без этого файла загрузка
