@@ -16,7 +16,9 @@ from sklearn.compose import ColumnTransformer
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import FunctionTransformer
 
+from mlops_phishing.features import normalize_urls
 from training.data import TARGET, Splits, load_dataset, log_splits, split_by_domain
 from training.evaluation import THRESHOLD, compute_metrics, log_diagnostics
 from training.tracking import setup_mlflow
@@ -29,16 +31,38 @@ def tfidf_logreg(ngram_min: int, ngram_max: int, min_df: int, c: float) -> Pipel
 
     c — обратная сила регуляризации (C в sklearn).
     """
-    vectorizer = TfidfVectorizer(
+    return _url_logreg(_tfidf(ngram_min, ngram_max, min_df), c)
+
+
+def normalized_tfidf_logreg(ngram_min: int, ngram_max: int, min_df: int, c: float) -> Pipeline:
+    """Как tfidf_logreg, но перед TF-IDF из URL убираются схема, www. и / в конце.
+
+    В датасете все легитимные URL начинаются с https://www. и не имеют пути,
+    и без нормализации модель учит этот формат, а не признаки фишинга.
+    """
+    url = Pipeline(
+        [
+            ("normalize", FunctionTransformer(normalize_urls, feature_names_out="one-to-one")),
+            ("tfidf", _tfidf(ngram_min, ngram_max, min_df)),
+        ]
+    )
+    return _url_logreg(url, c)
+
+
+def _tfidf(ngram_min: int, ngram_max: int, min_df: int) -> TfidfVectorizer:
+    return TfidfVectorizer(
         analyzer="char_wb",
         ngram_range=(ngram_min, ngram_max),
         min_df=min_df,
         sublinear_tf=True,
         dtype=np.float32,
     )
+
+
+def _url_logreg(url_features: TfidfVectorizer | Pipeline, c: float) -> Pipeline:
     return Pipeline(
         [
-            ("features", ColumnTransformer([("url", vectorizer, "URL")])),
+            ("features", ColumnTransformer([("url", url_features, "URL")])),
             ("classifier", LogisticRegression(C=c, max_iter=1000)),
         ]
     )
@@ -50,10 +74,18 @@ class Variant:
     params: dict[str, object]
     # Колонки, которые модель получает на вход. Для сервиса это только URL
     columns: tuple[str, ...] = ("URL",)
+    # Свои функции в пайплайне skops без явного разрешения не сохраняет
+    skops_trusted_types: tuple[str, ...] = ()
 
 
 VARIANTS: dict[str, Variant] = {
     "baseline": Variant(tfidf_logreg, {"ngram_min": 3, "ngram_max": 5, "min_df": 10, "c": 1.0}),
+    # Те же параметры, что у baseline: меняется только нормализация URL
+    "normalized": Variant(
+        normalized_tfidf_logreg,
+        {"ngram_min": 3, "ngram_max": 5, "min_df": 10, "c": 1.0},
+        skops_trusted_types=("mlops_phishing.features.normalize_urls",),
+    ),
 }
 
 
@@ -84,7 +116,7 @@ def run_variant(name: str, variant: Variant, splits: Splits) -> None:
 
         log_diagnostics(model, splits.test, test_proba)
         # После метрик: MLflow копирует метрики рана в карточку модели
-        log_model(model, splits.val[columns])
+        log_model(model, splits.val[columns], variant.skops_trusted_types)
 
 
 def _predict(model: Pipeline, part: pd.DataFrame, columns: list[str]) -> np.ndarray:
@@ -95,7 +127,9 @@ def _prefixed(prefix: str, metrics: dict[str, float]) -> dict[str, float]:
     return {f"{prefix}_{key}": value for key, value in metrics.items()}
 
 
-def log_model(model: Pipeline, sample: pd.DataFrame) -> None:
+def log_model(
+    model: Pipeline, sample: pd.DataFrame, skops_trusted_types: tuple[str, ...] = ()
+) -> None:
     sample = sample.head(100)
     signature = infer_signature(sample, model.predict_proba(sample))
     mlflow.sklearn.log_model(
@@ -104,6 +138,7 @@ def log_model(model: Pipeline, sample: pd.DataFrame) -> None:
         signature=signature,
         input_example=sample.head(3),
         pyfunc_predict_fn="predict_proba",
+        skops_trusted_types=list(skops_trusted_types) or None,
     )
 
 
