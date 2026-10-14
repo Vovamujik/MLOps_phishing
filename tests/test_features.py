@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from mlops_phishing.features import URL_FEATURES, normalize_urls, url_features
+from mlops_phishing.features import URL_FEATURES, extract_hosts, normalize_urls, url_features
 
 
 @pytest.mark.parametrize(
@@ -91,3 +91,31 @@ def test_url_features_empty_url_has_zero_ratios():
 
     assert features["length"] == 0
     assert features["digit_ratio"] == 0
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        ("https://www.google.com", "google.com"),
+        ("https://github.com/mlflow/mlflow", "github.com"),
+        ("http://example.com?id=1", "example.com"),
+        ("example.com#top", "example.com"),
+        ("https://docs.python.org/3/library/os.html", "docs.python.org"),
+        ("http://192.168.0.1:8080/admin", "192.168.0.1:8080"),
+        ("", ""),
+    ],
+)
+def test_extract_hosts(url, expected):
+    assert extract_hosts([url])[0] == expected
+
+
+def test_extract_hosts_accepts_series_and_returns_string_array():
+    result = extract_hosts(pd.Series(["https://www.a.com/x", "b.org"]))
+
+    assert isinstance(result, np.ndarray)
+    assert result.dtype.kind == "U"
+    assert result.tolist() == ["a.com", "b.org"]
+
+
+def test_extract_hosts_empty_input():
+    assert extract_hosts([]).shape == (0,)

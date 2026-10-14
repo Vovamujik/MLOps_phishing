@@ -19,6 +19,14 @@ def normalize_urls(urls: Iterable[str]) -> np.ndarray:
     return np.array([_PREFIX.sub("", url).rstrip("/") for url in urls], dtype=str)
 
 
+def extract_hosts(urls: Iterable[str]) -> np.ndarray:
+    """Нормализует URL, как normalize_urls, и оставляет только хост: всё до /, ? или #.
+
+    У легитимных URL датасета пути нет никогда, и модель по пути учит класс.
+    """
+    return np.array([re.split(r"[/?#]", url, maxsplit=1)[0] for url in normalize_urls(urls)])
+
+
 # Порядок колонок фиксирован: модель обучается и предсказывает по позициям
 URL_FEATURES = (
     "length",
