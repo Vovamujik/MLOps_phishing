@@ -12,9 +12,13 @@ uv sync
 uv run pre-commit install
 cp .env.example .env
 
-docker compose up -d --build        # приложение + Postgres
+docker compose up -d --build --wait   # весь стек: приложение, Postgres, MLflow (mlflow-db, s3)
 curl localhost:8000/api/v1/health
 ```
+
+Пока в реестре нет `phishing-url-clf@champion`, приложение работает без модели:
+`/api/v1/health` отвечает 503 (`model: unavailable`), `/api/v1/process` — тоже 503.
+Как обучить и зарегистрировать модель — в разделе [MLflow](#mlflow).
 
 Без Docker: `uv run uvicorn mlops_phishing.app:app --reload`
 (Postgres из compose доступен на `localhost:5433`).
@@ -142,7 +146,7 @@ app (FastAPI) ── http://mlflow:5000 ──▶ mlflow (сервер + UI)
 
 ```bash
 uv sync --all-groups                          # обычный `uv sync` удалит группу ml
-docker compose up -d --build --wait
+docker compose up -d --wait mlflow            # только MLflow (+ mlflow-db, s3): приложению пока нечего загружать
 uv run python -m training.download_data       # CSV в data/raw/ + проверка sha256
 
 uv run python -m training.eda                 # ран в эксперименте phiusiil-eda
@@ -154,13 +158,15 @@ uv run python -m training.registry register <run_id normalized>  # v2
 uv run python -m training.registry alias champion 2
 uv run python -m training.registry show
 
-docker compose up -d --build app              # пересобрать: в образе нужен features.py
+docker compose up -d --build --wait           # приложение стартует, когда @champion уже есть
 curl -s -X POST localhost:8000/api/v1/process -H 'Content-Type: application/json' \
   -d '{"url": "https://secure-login-paypal.example.com/verify/account"}'
 ```
 
 Приложение при старте один раз разрешает `phishing-url-clf@champion` в номер
-версии и загружает её. Ответ при `@champion` → v2 (`normalized`) на запрос
+версии и загружает её. Если оно уже запущено (например, после быстрого старта),
+после `alias` нужен `docker compose up -d --build app` или `docker compose restart app`:
+без рестарта модель не перечитывается. Ответ при `@champion` → v2 (`normalized`) на запрос
 `{"url": "https://secure-login-paypal.example.com/verify/account"}`:
 
 ```json
@@ -175,14 +181,14 @@ curl -s -X POST localhost:8000/api/v1/process -H 'Content-Type: application/json
 `"model_version":"1"`. `registry alias champion 2` и ещё один рестарт
 возвращают v2. Версия меняется только при старте приложения.
 
-Модели `normalized` и `host-only` ссылаются на функции из
+Модели `normalized`, `handcrafted` и `host-only` ссылаются на функции из
 `src/mlops_phishing/features.py`. Со старым образом без этого файла загрузка
 упадёт с `ModuleNotFoundError`: приложение стартует без модели, `/process`
 отвечает 503, причина в логе.
 
 ### EDA
 
-Эксперимент `phiusiil-eda`, ран `91c2e3f6776d4bf6b70aad1ebc9dfd61`: 8 графиков,
+Эксперимент `phiusiil-eda`, ран `eda`: 8 графиков,
 таблица ROC-AUC каждого числового признака, выводы `conclusions.md`.
 Датасет: 235 795 URL, 134 850 легитимных и 100 945 фишинга (42.8%),
 константная модель даёт accuracy 0.572. В датасете много подсказок,
@@ -214,31 +220,41 @@ curl -s -X POST localhost:8000/api/v1/process -H 'Content-Type: application/json
 | `handcrafted` | 12 своих признаков нормализованного URL (длина, доли символов, поддомены, IP, `xn--`, login/verify/account, бесплатные хостинги) → HistGradientBoosting |
 | `host-only` | как `normalized`, но TF-IDF только по хосту, без пути и query |
 
-| Вариант | Ран | val PR-AUC | test PR-AUC | val recall | test recall | val FPR | test FPR | train, с | predict, мс/1000 URL |
-|---|---|---|---|---|---|---|---|---|---|
-| `baseline` | `d8667df9` | 0.9989 | 0.9992 | 0.9902 | 0.9923 | 0.0000 | 0.0000 | 5.1 | 20.9 |
-| `normalized` | `3c5b626c` | **0.9543** | 0.9472 | 0.8128 | 0.7946 | 0.0260 | 0.0239 | 7.3 | 16.7 |
-| `handcrafted` | `4c598498` | 0.8946 | 0.8790 | 0.6830 | 0.6529 | 0.0269 | 0.0287 | 4.3 | 6.4 |
-| `host-only` | `3349cb31` | 0.9372 | 0.9282 | 0.7687 | 0.7464 | 0.0385 | 0.0356 | 5.5 | 14.0 |
+Раны в UI называются по варианту. Метрики детерминированы: сплит и модели
+с фиксированным seed, повторный запуск даёт те же числа. Время зависит от машины.
+
+| Вариант | val PR-AUC | test PR-AUC | val recall | test recall | val FPR | test FPR | train, с | predict, мс/1000 URL |
+|---|---|---|---|---|---|---|---|---|
+| `baseline` | 0.9989 | 0.9992 | 0.9902 | 0.9923 | 0.0000 | 0.0000 | 5.1 | 20.9 |
+| `normalized` | **0.9543** | 0.9472 | 0.8128 | 0.7946 | 0.0260 | 0.0239 | 7.3 | 16.7 |
+| `handcrafted` | 0.8946 | 0.8790 | 0.6830 | 0.6529 | 0.0269 | 0.0287 | 4.3 | 6.4 |
+| `host-only` | 0.9371 | 0.9279 | 0.7697 | 0.7457 | 0.0393 | 0.0363 | 4.3 | 15.0 |
 
 Проверка на отдельных URL, вероятность фишинга:
 
 | URL | baseline | normalized | handcrafted | host-only |
 |---|---|---|---|---|
-| `https://www.google.com` | 0.001 | 0.713 | 0.230 | 0.907 |
-| `https://github.com/mlflow/mlflow` | 0.990 | 0.963 | 1.000 | 0.741 |
-| `https://github.com` | 0.696 | 0.588 | 0.230 | 0.741 |
-| `https://www.wikipedia.org` | 0.002 | 0.029 | 0.208 | 0.034 |
-| `https://www.microsoft.com` | 0.009 | 0.576 | 0.208 | 0.561 |
-| `https://docs.python.org/3/library/os.html` | 0.976 | 0.924 | 1.000 | 0.368 |
+| `https://www.google.com` | 0.001 | 0.713 | 0.230 | 0.911 |
+| `https://github.com/mlflow/mlflow` | 0.990 | 0.963 | 1.000 | 0.747 |
+| `https://github.com` | 0.696 | 0.588 | 0.230 | 0.747 |
+| `https://www.wikipedia.org` | 0.002 | 0.029 | 0.208 | 0.030 |
+| `https://www.microsoft.com` | 0.009 | 0.576 | 0.208 | 0.570 |
+| `https://docs.python.org/3/library/os.html` | 0.976 | 0.924 | 1.000 | 0.364 |
 | `http://paypal-verify-account.web.app` | 1.000 | 0.998 | 1.000 | 0.999 |
-| `https://secure-login-paypal.example.com/verify/account` | 0.998 | 0.998 | 1.000 | 0.931 |
+| `https://secure-login-paypal.example.com/verify/account` | 0.998 | 0.998 | 1.000 | 0.928 |
 
 ### Выводы
 
 - **v2 = `normalized`.** Критерий заявлен заранее: лучший `val_pr_auc` среди
   вариантов без прямой подсказки схемы и `www.`. У `normalized` 0.954 против
   0.937 у `host-only` и 0.895 у `handcrafted`.
+- **Но перевес над `host-only` целиком даёт путь.** В val нет ни одного
+  легитимного URL с путём, и правило «есть путь → фишинг» даёт precision 1.000
+  при recall 0.334. На URL без пути (все 20 260 легитимных и 10 733 фишинговых
+  в val) варианты равны: PR-AUC 0.909 у обоих, на test тоже. `normalized`
+  оставили v2: на URL без пути он не хуже, а путь в реальном трафике несёт
+  настоящие признаки фишинга (`/login`, `/verify`). В этом датасете путь —
+  ещё и утечка, см. ограничения.
 - **`baseline` в отбор не идёт** и остаётся v1 для истории. Его 0.999 держится
   на префиксе `https://www.`, найденном в EDA: google он считает легитимным
   только потому, что URL начинается с `https://www.`.

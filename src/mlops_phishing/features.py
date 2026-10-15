@@ -16,7 +16,9 @@ _PREFIX = re.compile(r"^(https?://)?(www\.)?", re.IGNORECASE)
 
 def normalize_urls(urls: Iterable[str]) -> np.ndarray:
     """Убирает из каждого URL схему http(s)://, www. и / в конце."""
-    return np.array([_PREFIX.sub("", url).rstrip("/") for url in urls], dtype=str)
+    # object, а не str: строковый массив numpy дополняет каждую строку до самой
+    # длинной, и на train из-за одного URL в 6 тыс. символов вышло бы 3.8 GB
+    return np.array([_PREFIX.sub("", url).rstrip("/") for url in urls], dtype=object)
 
 
 def extract_hosts(urls: Iterable[str]) -> np.ndarray:
@@ -24,7 +26,8 @@ def extract_hosts(urls: Iterable[str]) -> np.ndarray:
 
     У легитимных URL датасета пути нет никогда, и модель по пути учит класс.
     """
-    return np.array([re.split(r"[/?#]", url, maxsplit=1)[0] for url in normalize_urls(urls)])
+    hosts = [re.split(r"[/?#]", url, maxsplit=1)[0] for url in normalize_urls(urls)]
+    return np.array(hosts, dtype=object)
 
 
 # Порядок колонок фиксирован: модель обучается и предсказывает по позициям

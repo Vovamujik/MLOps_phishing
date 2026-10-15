@@ -75,10 +75,10 @@ def _tfidf(ngram_min: int, ngram_max: int, min_df: int) -> TfidfVectorizer:
     )
 
 
-def _url_logreg(url_features: TfidfVectorizer | Pipeline, c: float) -> Pipeline:
+def _url_logreg(url_transformer: TfidfVectorizer | Pipeline, c: float) -> Pipeline:
     return Pipeline(
         [
-            ("features", ColumnTransformer([("url", url_features, "URL")])),
+            ("features", ColumnTransformer([("url", url_transformer, "URL")])),
             ("classifier", LogisticRegression(C=c, max_iter=1000)),
         ]
     )

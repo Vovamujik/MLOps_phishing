@@ -26,7 +26,7 @@ def test_normalize_urls_accepts_series_and_returns_string_array():
     result = normalize_urls(pd.Series(["https://www.a.com/", "http://b.org"]))
 
     assert isinstance(result, np.ndarray)
-    assert result.dtype.kind == "U"
+    assert result.dtype == object
     assert result.tolist() == ["a.com", "b.org"]
 
 
@@ -113,9 +113,17 @@ def test_extract_hosts_accepts_series_and_returns_string_array():
     result = extract_hosts(pd.Series(["https://www.a.com/x", "b.org"]))
 
     assert isinstance(result, np.ndarray)
-    assert result.dtype.kind == "U"
+    assert result.dtype == object
     assert result.tolist() == ["a.com", "b.org"]
 
 
 def test_extract_hosts_empty_input():
     assert extract_hosts([]).shape == (0,)
+
+
+@pytest.mark.parametrize("transform", [normalize_urls, extract_hosts])
+def test_long_url_does_not_inflate_the_array(transform):
+    """Одна длинная строка не раздувает массив: каждая хранится своей длины."""
+    result = transform(["a.com", "b" * 10_000])
+
+    assert result.nbytes < 1_000
