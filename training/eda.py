@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 from matplotlib.axes import Axes
 from matplotlib.figure import Figure
+from mlflow.data.pandas_dataset import from_pandas
 from sklearn.metrics import roc_auc_score
 
 from training.data import TARGET
@@ -63,16 +64,16 @@ def feature_auc(df: pd.DataFrame) -> pd.DataFrame:
     page_features = set(df.columns[df.columns.get_loc(FIRST_PAGE_FEATURE) :])
     y = df[TARGET]
     rows = []
-    for column in numeric:
-        auc = roc_auc_score(y, numeric[column])
+    for column, values in numeric.items():
+        auc = roc_auc_score(y, values)
         rows.append(
             {
                 "feature": column,
                 "source": "page" if column in page_features else "url",
                 "roc_auc": round(auc, 4),
                 "auc_any_direction": round(max(auc, 1 - auc), 4),
-                "median_legit": numeric.loc[y == 0, column].median(),
-                "median_phishing": numeric.loc[y == 1, column].median(),
+                "median_legit": values[y == 0].median(),
+                "median_phishing": values[y == 1].median(),
             }
         )
     return pd.DataFrame(rows).sort_values("auc_any_direction", ascending=False, ignore_index=True)
@@ -153,17 +154,18 @@ def plot_class_balance(df: pd.DataFrame) -> Figure:
 
 def plot_hist_by_class(df: pd.DataFrame, column: str, title: str, clip_quantile: float) -> Figure:
     """Нормированные гистограммы по классам; длинный хвост обрезаем по квантилю."""
-    upper = df[column].quantile(clip_quantile)
+    upper = float(df[column].quantile(clip_quantile))
     bins = np.linspace(df[column].min(), upper, 50)
     fig, ax = _figure()
-    for cls, part in df.groupby(TARGET)[column]:
+    for cls, name in CLASSES.items():
+        part = df.loc[df[TARGET] == cls, column]
         ax.hist(
             part.clip(upper=upper),
             bins=bins,
             density=True,
             alpha=0.5,
             color=COLORS[cls],
-            label=f"{CLASSES[cls]} (медиана {part.median():.2f})",
+            label=f"{name} (медиана {part.median():.2f})",
         )
     ax.set_xlabel(f"{column} (обрезано по {clip_quantile:.0%}-квантилю)")
     ax.set_ylabel("плотность")
@@ -186,10 +188,11 @@ def plot_subdomains(df: pd.DataFrame) -> Figure:
 def plot_top_tld(df: pd.DataFrame) -> Figure:
     fig = Figure(figsize=(10, 5), layout="constrained")
     axes = fig.subplots(1, 2)
-    for ax, (cls, part) in zip(axes, df.groupby(TARGET)["TLD"], strict=True):
+    for ax, (cls, name) in zip(axes, CLASSES.items(), strict=True):
+        part = df.loc[df[TARGET] == cls, "TLD"]
         top = part.value_counts(normalize=True).head(TOP_TLD)[::-1]
         ax.barh(top.index, top, color=COLORS[cls])
-        ax.set_title(f"Топ-{TOP_TLD} TLD: {CLASSES[cls]}")
+        ax.set_title(f"Топ-{TOP_TLD} TLD: {name}")
         ax.set_xlabel("доля URL класса")
     return fig
 
@@ -197,8 +200,9 @@ def plot_top_tld(df: pd.DataFrame) -> Figure:
 def plot_url_similarity(df: pd.DataFrame, facts: dict[str, float]) -> Figure:
     fig, ax = _figure()
     bins = np.linspace(0, 100, 51)
-    for cls, part in df.groupby(TARGET)["URLSimilarityIndex"]:
-        ax.hist(part, bins=bins, density=True, alpha=0.5, color=COLORS[cls], label=CLASSES[cls])
+    for cls, name in CLASSES.items():
+        part = df.loc[df[TARGET] == cls, "URLSimilarityIndex"]
+        ax.hist(part, bins=bins, density=True, alpha=0.5, color=COLORS[cls], label=name)
     ax.set_xlabel("URLSimilarityIndex")
     ax.set_ylabel("плотность")
     ax.set_title(
@@ -232,8 +236,8 @@ def plot_share_by_category(df: pd.DataFrame, category: pd.Series, title: str) ->
 def _grouped_bars(ax: Axes, share: pd.DataFrame, labels: list[str]) -> None:
     x = np.arange(len(share))
     width = 0.4
-    for offset, cls in zip((-width / 2, width / 2), share.columns, strict=True):
-        ax.bar(x + offset, share[cls], width, color=COLORS[cls], label=CLASSES[cls])
+    for offset, (cls, name) in zip((-width / 2, width / 2), CLASSES.items(), strict=True):
+        ax.bar(x + offset, share[cls], width, color=COLORS[cls], label=name)
     ax.set_xticks(x, labels)
     ax.legend()
 
@@ -250,7 +254,7 @@ def main() -> None:
     auc = feature_auc(df)
 
     with mlflow.start_run(run_name="eda"):
-        dataset = mlflow.data.from_pandas(
+        dataset = from_pandas(
             df.drop(columns=TARGET), source=DATASET_URL, name="phiusiil-raw", targets="label"
         )
         mlflow.log_input(dataset, context="eda")

@@ -9,6 +9,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 import mlflow
+import mlflow.sklearn as mlflow_sklearn
 import numpy as np
 import pandas as pd
 from mlflow.models import infer_signature
@@ -181,7 +182,7 @@ def log_model(
 ) -> None:
     sample = sample.head(100)
     signature = infer_signature(sample, model.predict_proba(sample))
-    mlflow.sklearn.log_model(
+    mlflow_sklearn.log_model(
         model,
         name="model",
         signature=signature,

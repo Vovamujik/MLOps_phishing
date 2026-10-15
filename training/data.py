@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import mlflow
 import numpy as np
 import pandas as pd
+from mlflow.data.pandas_dataset import from_pandas
 from sklearn.model_selection import GroupShuffleSplit
 
 from training.download_data import CSV_PATH, CSV_SHA256, DATASET_URL, sha256_of
@@ -59,9 +60,7 @@ def log_splits(splits: Splits) -> None:
     """Регистрирует части как входные датасеты активного рана MLflow."""
     contexts = {"train": "training", "val": "validation", "test": "test"}
     for name, part in splits.named():
-        dataset = mlflow.data.from_pandas(
-            part, source=DATASET_URL, name=f"phiusiil-{name}", targets=TARGET
-        )
+        dataset = from_pandas(part, source=DATASET_URL, name=f"phiusiil-{name}", targets=TARGET)
         mlflow.log_input(dataset, context=contexts[name])
 
     # Digest MLflow считается только по первым 10 000 строк, поэтому полный хеш файла пишем отдельно

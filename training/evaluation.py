@@ -30,14 +30,14 @@ def compute_metrics(y_true: pd.Series, proba: np.ndarray) -> dict[str, float]:
     tn, fp, _, _ = confusion_matrix(y_true, pred, labels=[0, 1]).ravel()
     return {
         # Основная: не зависит от порога и показывает, как модель ранжирует фишинг
-        "pr_auc": average_precision_score(y_true, proba),
-        "roc_auc": roc_auc_score(y_true, proba),
-        "precision": precision_score(y_true, pred, zero_division=0),
-        "recall": recall_score(y_true, pred),
-        "f1": f1_score(y_true, pred),
+        "pr_auc": float(average_precision_score(y_true, proba)),
+        "roc_auc": float(roc_auc_score(y_true, proba)),
+        "precision": float(precision_score(y_true, pred, zero_division=0)),
+        "recall": float(recall_score(y_true, pred)),
+        "f1": float(f1_score(y_true, pred)),
         # Доля легитимных сайтов, которые мы зря назвали фишингом
-        "fpr": fp / (fp + tn),
-        "accuracy": accuracy_score(y_true, pred),
+        "fpr": float(fp / (fp + tn)),
+        "accuracy": float(accuracy_score(y_true, pred)),
     }
 
 

@@ -117,6 +117,7 @@ async def test_missing_model_is_unavailable_not_a_crash():
     )
 
     assert component.status is ComponentStatus.unavailable
+    assert component.error is not None
     assert "ModelUnavailableError" in component.error
 
 

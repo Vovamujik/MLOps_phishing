@@ -3,7 +3,7 @@
 import logging
 from types import SimpleNamespace
 
-import mlflow.sklearn
+import mlflow.sklearn as mlflow_sklearn
 import pytest
 from mlflow.exceptions import MlflowException
 
@@ -39,7 +39,7 @@ def registry(monkeypatch):
 
     monkeypatch.setattr(ml, "MlflowClient", lambda: fake.client)
     monkeypatch.setattr(ml.mlflow, "set_tracking_uri", fake.tracking_uris.append)
-    monkeypatch.setattr(mlflow.sklearn, "load_model", fake_load)
+    monkeypatch.setattr(mlflow_sklearn, "load_model", fake_load)
     return fake
 
 

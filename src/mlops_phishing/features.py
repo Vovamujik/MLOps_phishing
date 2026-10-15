@@ -58,7 +58,7 @@ def url_features(urls: pd.DataFrame | pd.Series) -> pd.DataFrame:
     """
     if isinstance(urls, pd.DataFrame):
         urls = urls["URL"]
-    url = pd.Series(normalize_urls(urls), index=urls.index).str.lower()
+    url = pd.Series(normalize_urls(urls), index=urls.index, dtype=str).str.lower()
     # Хост: до пути, query или фрагмента, без логина и порта
     host = url.str.split(r"[/?#]", n=1, regex=True).str[0]
     host = host.str.rsplit("@", n=1).str[-1].str.replace(r":\d+$", "", regex=True)

@@ -35,7 +35,8 @@ def test_normalize_urls_empty_input():
 
 
 def features_of(url: str) -> dict[str, float]:
-    return url_features(pd.Series([url])).iloc[0].to_dict()
+    row = url_features(pd.Series([url])).iloc[0]
+    return {str(name): float(value) for name, value in row.items()}
 
 
 def test_url_features_columns_are_fixed_and_numeric():

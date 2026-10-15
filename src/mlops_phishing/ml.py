@@ -11,9 +11,10 @@ import os
 import tempfile
 import time
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Protocol, cast
 
-import mlflow.sklearn
+import mlflow
+import mlflow.sklearn as mlflow_sklearn
 import numpy as np
 import pandas as pd
 from mlflow import MlflowClient
@@ -41,7 +42,8 @@ class LoadedModel:
     name: str
     version: str
     alias: str
-    run_id: str
+    # У версии, зарегистрированной не из рана, run_id нет
+    run_id: str | None
     classifier: Classifier
 
     def phishing_probability(self, url: str) -> float:
@@ -67,8 +69,11 @@ def load_model(settings: Settings) -> LoadedModel:
     number = str(version.version)
     # Файлы модели нужны только на время десериализации, дальше она живёт в памяти
     with tempfile.TemporaryDirectory() as tmp:
-        classifier = mlflow.sklearn.load_model(
-            f"models:/{settings.model_name}/{number}", dst_path=tmp
+        # У MLflow нет аннотаций, и pyright видит в ответе None. Его не бывает:
+        # неизвестный формат модели MLflow отвергает раньше, исключением
+        classifier = cast(
+            Classifier,
+            mlflow_sklearn.load_model(f"models:/{settings.model_name}/{number}", dst_path=tmp),
         )
     return LoadedModel(
         name=settings.model_name,
