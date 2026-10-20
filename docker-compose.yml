@@ -96,6 +96,42 @@ services:
         condition: service_healthy
     logging: *default-logging
 
+  # Воркер: задачи из очереди → модель → результат в базу. Порт наружу не публикуем,
+  # чтобы работал docker compose up -d --scale worker=2
+  worker:
+    image: mlops-phishing:local
+    restart: unless-stopped
+    command: ["faststream", "run", "mlops_phishing.worker:app", "--host", "0.0.0.0", "--port", "8001"]
+    environment:
+      RABBITMQ_URL: amqp://${RABBITMQ_USER:-app}:${RABBITMQ_PASSWORD:-app}@rabbitmq:5672/
+      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-mlops_phishing}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      MODEL_NAME: ${MODEL_NAME:-phishing-url-clf}
+      MODEL_ALIAS: ${MODEL_ALIAS:-champion}
+      MLFLOW_DISABLE_TELEMETRY: "true"
+      WORKER_POOL_SIZE: ${WORKER_POOL_SIZE:-4}
+      WORKER_PREFETCH: ${WORKER_PREFETCH:-4}
+      INFERENCE_DELAY_SECONDS: ${INFERENCE_DELAY_SECONDS:-0.2}
+      WORKER_GRACEFUL_TIMEOUT: ${WORKER_GRACEFUL_TIMEOUT:-30}
+    # Больше graceful timeout воркера: Docker не добьёт SIGKILL, пока задачи дописываются
+    stop_grace_period: 40s
+    # Healthcheck образа смотрит на /healthz приложения, у воркера свой /health
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mlflow:
+        condition: service_healthy
+      rabbitmq-init:
+        condition: service_completed_successfully
+    logging: *default-logging
+
   mlflow-db:
     image: postgres:16-alpine
     restart: unless-stopped

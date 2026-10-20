@@ -78,6 +78,30 @@ class Settings(BaseSettings):
         description="Сколько повторных доставок даётся задаче, прежде чем она уйдёт в DLQ.",
     )
 
+    worker_pool_size: int = Field(
+        default=4,
+        gt=0,
+        description="Потоков для inference в одном воркере: столько задач считается одновременно.",
+    )
+    # prefetch = размер пула: каждой взятой задаче сразу есть свободный поток.
+    # Больше — лишние задачи ждут в памяти воркера, и второй воркер их не заберёт;
+    # меньше — потоки простаивают. 0 — без ограничения, только для эксперимента
+    worker_prefetch: int = Field(
+        default=4,
+        ge=0,
+        description="Сколько неподтверждённых сообщений брокер отдаёт одному воркеру.",
+    )
+    inference_delay_seconds: float = Field(
+        default=0.2,
+        ge=0,
+        description="Добавочное время inference: имитация тяжёлой модели для экспериментов.",
+    )
+    worker_graceful_timeout: float = Field(
+        default=30.0,
+        gt=0,
+        description="Сколько при остановке ждать задачи, уже взятые в работу, секунды.",
+    )
+
 
 @cache
 def get_settings() -> Settings:
