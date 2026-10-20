@@ -17,6 +17,7 @@ dependencies = [
     "scikit-learn>=1.7",
     "pandas>=2.2",
     "skops>=0.13",
+    "faststream[cli,rabbit]>=0.7.7,<0.8",
 ]
 
 [dependency-groups]
@@ -28,6 +29,7 @@ dev = [
     "pytest-cov>=6.0.0",
     "httpx>=0.28.0",
     "asgi-lifespan>=2.1.0",
+    "testcontainers[rabbitmq]>=4.15",
 ]
 # Обучение и EDA на ноутбуке, в образ не попадает
 ml = [

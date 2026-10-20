@@ -49,6 +49,51 @@ services:
         condition: service_healthy
       mlflow:
         condition: service_healthy
+      rabbitmq-init:
+        condition: service_completed_successfully
+    logging: *default-logging
+
+  # Брокер задач. Management UI на http://localhost:15672
+  rabbitmq:
+    image: rabbitmq:4.3.6-management
+    # Имя узла rabbit@<hostname>: без фиксированного имени данные в томе не переживут пересоздание
+    hostname: rabbitmq
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-app}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-app}
+      # Docker Desktop 29: Erlang не может прочитать cookie, который сам создал (eacces),
+      # и брокер падает на старте. Cookie задаём явно серверу и CLI (healthcheck, rabbitmqctl)
+      RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS: -setcookie ${RABBITMQ_ERLANG_COOKIE:-mlops-phishing}
+      RABBITMQ_CTL_ERL_ARGS: -setcookie ${RABBITMQ_ERLANG_COOKIE:-mlops-phishing}
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_running"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    logging: *default-logging
+
+  # Одноразово задаёт топологию: очередь tasks, policy с лимитами, DLX и DLQ
+  rabbitmq-init:
+    build:
+      context: .
+    image: mlops-phishing:local
+    restart: "no"
+    command: ["python", "-m", "mlops_phishing.rabbit_setup"]
+    environment:
+      RABBITMQ_URL: amqp://${RABBITMQ_USER:-app}:${RABBITMQ_PASSWORD:-app}@rabbitmq:5672/
+      RABBITMQ_MANAGEMENT_URL: http://rabbitmq:15672
+      TASKS_QUEUE_MAX_LENGTH: ${TASKS_QUEUE_MAX_LENGTH:-100}
+      TASKS_DELIVERY_LIMIT: ${TASKS_DELIVERY_LIMIT:-3}
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
     logging: *default-logging
 
   mlflow-db:
@@ -148,5 +193,6 @@ services:
 
 volumes:
   postgres_data:
+  rabbitmq_data:
   mlflow_db_data:
   s3_data:

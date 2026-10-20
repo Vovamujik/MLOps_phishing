@@ -59,6 +59,25 @@ class Settings(BaseSettings):
         description="Порог вероятности, начиная с которого URL считается фишингом.",
     )
 
+    rabbitmq_url: str = Field(
+        default="amqp://app:app@localhost:5672/",
+        description="Подключение к RabbitMQ (AMQP). Логин и пароль из него же идут в HTTP API.",
+    )
+    rabbitmq_management_url: str = Field(
+        default="http://localhost:15672",
+        description="HTTP API управления RabbitMQ: через него задаётся топология очередей.",
+    )
+    tasks_queue_max_length: int = Field(
+        default=100,
+        gt=0,
+        description="Лимит готовых сообщений в очереди задач; сверх него брокер отвечает nack.",
+    )
+    tasks_delivery_limit: int = Field(
+        default=3,
+        gt=0,
+        description="Сколько повторных доставок даётся задаче, прежде чем она уйдёт в DLQ.",
+    )
+
 
 @cache
 def get_settings() -> Settings:
