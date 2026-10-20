@@ -9,7 +9,7 @@ import uuid
 from datetime import datetime
 from typing import Literal
 
-from faststream.rabbit import QueueType, RabbitQueue
+from faststream.rabbit import QueueType, RabbitBroker, RabbitQueue
 from faststream.rabbit.schemas import Channel
 from pydantic import BaseModel, Field
 
@@ -34,3 +34,14 @@ class TaskMessage(BaseModel):
     source: Literal["api", "batch"]
     # Момент постановки в очередь: от него считается время выполнения задачи
     enqueued_at: datetime
+
+
+async def publish_task(broker: RabbitBroker, task: TaskMessage) -> None:
+    """Опубликовать задачу и дождаться ответа брокера.
+
+    Брокер должен быть открыт с PUBLISH_CHANNEL. Очередь полна — DeliveryError (nack),
+    очереди нет — PublishError (mandatory по умолчанию). persist для наглядности:
+    quorum-очередь и так пишет всё на диск, а сохранность гарантирует confirm — ack
+    приходит после записи на большинство узлов.
+    """
+    await broker.publish(task, queue=TASKS_QUEUE, message_id=str(task.task_id), persist=True)

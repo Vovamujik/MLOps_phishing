@@ -38,16 +38,18 @@ services:
       DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-mlops_phishing}
       ENVIRONMENT: ${ENVIRONMENT:-development}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
-      MLFLOW_TRACKING_URI: http://mlflow:5000
-      MODEL_NAME: ${MODEL_NAME:-phishing-url-clf}
-      MODEL_ALIAS: ${MODEL_ALIAS:-champion}
-      MLFLOW_DISABLE_TELEMETRY: "true"
+      RABBITMQ_URL: amqp://${RABBITMQ_USER:-app}:${RABBITMQ_PASSWORD:-app}@rabbitmq:5672/
+      PUBLISH_TIMEOUT: ${PUBLISH_TIMEOUT:-2}
+      # Из них API считает Retry-After: должны совпадать с очередью и воркером
+      TASKS_QUEUE_MAX_LENGTH: ${TASKS_QUEUE_MAX_LENGTH:-100}
+      WORKER_POOL_SIZE: ${WORKER_POOL_SIZE:-4}
+      WORKER_PREFETCH: ${WORKER_PREFETCH:-4}
+      INFERENCE_DELAY_SECONDS: ${INFERENCE_DELAY_SECONDS:-0.2}
     ports:
       - "8000:8000"
+    # Модели в API нет — MLflow ему не нужен
     depends_on:
       postgres:
-        condition: service_healthy
-      mlflow:
         condition: service_healthy
       rabbitmq-init:
         condition: service_completed_successfully

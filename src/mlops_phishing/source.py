@@ -49,7 +49,7 @@ from pydantic import ValidationError
 
 from mlops_phishing import logging_config
 from mlops_phishing.config import Settings, get_settings
-from mlops_phishing.messaging import PUBLISH_CHANNEL, TASKS_QUEUE, TaskMessage
+from mlops_phishing.messaging import PUBLISH_CHANNEL, TASKS_QUEUE, TaskMessage, publish_task
 
 # Не __name__: под python -m он равен __main__
 log = logging.getLogger("mlops_phishing.source")
@@ -197,11 +197,9 @@ async def report_progress(stats: SourceStats, interval: float = REPORT_EVERY) ->
 
 
 def broker_publisher(broker: RabbitBroker) -> Publish:
+    # Без таймаута: если брокер завис (memory alarm), источнику и надо ждать — это тоже давление
     async def publish(task: TaskMessage) -> None:
-        # mandatory (по умолчанию) и PUBLISH_CHANNEL: нет очереди — PublishError, а не потеря.
-        # persist для наглядности: quorum-очередь и так пишет всё на диск, а сохранность
-        # гарантирует confirm — ack приходит после записи на большинство узлов
-        await broker.publish(task, queue=TASKS_QUEUE, message_id=str(task.task_id), persist=True)
+        await publish_task(broker, task)
 
     return publish
 

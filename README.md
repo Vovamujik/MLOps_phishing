@@ -1,9 +1,11 @@
 # MLOps Phishing Detector
 
-Асинхронный FastAPI-сервис обнаружения фишинговых сайтов по URL
-(датасет PhiUSIIL, UCI). Модель берётся из MLflow Model Registry
-(`phishing-url-clf@champion`) и загружается один раз при старте, подробнее —
-в разделе [MLflow](#mlflow).
+Сервис обнаружения фишинговых сайтов по URL (датасет PhiUSIIL, UCI).
+API на FastAPI принимает задачи и кладёт их в ограниченную очередь RabbitMQ,
+воркер на FastStream считает их моделью из MLflow Model Registry
+(`phishing-url-clf@champion`, загружается один раз при старте воркера) и пишет
+результат в Postgres. Подробнее — в разделах [Конвейер задач](#конвейер-задач)
+и [MLflow](#mlflow).
 
 ## Быстрый старт
 
@@ -12,16 +14,19 @@ uv sync
 uv run pre-commit install
 cp .env.example .env
 
-docker compose up -d --build --wait   # весь стек: приложение, Postgres, MLflow (mlflow-db, s3)
+docker compose up -d --build --wait   # API, воркер, RabbitMQ, Postgres, MLflow (mlflow-db, s3)
 curl localhost:8000/api/v1/health
 ```
 
-Пока в реестре нет `phishing-url-clf@champion`, приложение работает без модели:
-`/api/v1/health` отвечает 503 (`model: unavailable`), `/api/v1/process` — тоже 503.
-Как обучить и зарегистрировать модель — в разделе [MLflow](#mlflow).
+Воркеру нужна `phishing-url-clf@champion` в реестре: без неё он падает при
+старте, и `--wait` его не дождётся. Сначала модель (раздел [MLflow](#mlflow)),
+или стек без воркера: `docker compose up -d --build --wait app` — API принимает
+задачи, они ждут в очереди.
 
-Без Docker: `uv run uvicorn mlops_phishing.app:app --reload`
-(Postgres из compose доступен на `localhost:5433`).
+Без Docker: `docker compose up -d postgres rabbitmq rabbitmq-init`, затем
+`uv run uvicorn mlops_phishing.app:app --reload` и воркер
+`uv run faststream run mlops_phishing.worker:app` (адреса Postgres `:5433`,
+RabbitMQ `:5672` и MLflow `:5050` — в `.env.example`).
 
 ## Эндпоинты
 
@@ -29,8 +34,61 @@ curl localhost:8000/api/v1/health
 |---|---|---|
 | GET | `/healthz` | liveness-проба: процесс жив. Не версионируется и не ходит в БД |
 | GET | `/api/v1/version` | версия из метаданных пакета, git-коммит и время сборки образа |
-| GET | `/api/v1/health` | версии и `latency_ms` зависимостей; 200 или 503 |
-| POST | `/api/v1/process` | `{"url"}` → вероятность фишинга и версия модели; 503, если модель не загружена |
+| GET | `/api/v1/health` | версии и `latency_ms` Postgres и RabbitMQ; 200 или 503 |
+| POST | `/api/v1/tasks` | `{"url"}` → 202, `task_id` и ссылка на результат в `Location`; 503 и `Retry-After`, если очередь полна; 503 без него, если брокер не ответил за `PUBLISH_TIMEOUT` (2 с) |
+| GET | `/api/v1/tasks/{task_id}` | статус `PENDING` или `DONE` и результат: вероятность фишинга, версия модели; 404, если задачи нет или она ещё не записана |
+
+## Конвейер задач
+
+```
+источник CSV ──────┐
+                   ├─ publish + confirm ─▶ [tasks] quorum-очередь: лимит 100, reject-publish
+POST /api/v1/tasks ┘     nack, если полна       │ prefetch 4 = 4 потока inference
+                                                ▼
+       Postgres ◀── upsert по task_id ── worker (FastStream, модель @champion)
+                                                │ 3 неудачные доставки
+                                                ▼
+                                       tasks.dlx → [tasks.dlq]
+```
+
+| Сервис | Что делает |
+|---|---|
+| `rabbitmq` | брокер; Management UI http://localhost:15672 (`app` / `app`) |
+| `rabbitmq-init` | при каждом `up` задаёт очередь `tasks`, policy с лимитом и повторами, DLQ |
+| `worker` | модель по alias, inference в пуле потоков, результат в базу; второй — `docker compose up -d --scale worker=2` |
+| `source` | пакетный скоринг CSV, запускается вручную: `docker compose run --rm source --limit 2000` |
+
+Когда очередь полна, брокер отвечает издателю nack, и дальше по-разному:
+
+- **источник** внутри контура: ждёт с растущей паузой и шлёт ту же задачу
+  снова. Буфера нет, скорость сама равна пропускной способности воркеров —
+  это противодавление;
+- **внешний клиент** вне контура, замедлить его нельзя: API сразу отвечает 503
+  с `Retry-After` и ничего не пишет в базу — это сброс нагрузки (load shedding).
+  `Retry-After` — время, за которое один воркер разберёт 20% лимита: после
+  отказа quorum-очередь снова принимает с 80% лимита. При настройках по
+  умолчанию 20 задач / 20 задач/с = 1 с.
+
+Статуса `FAILED` нет: задача, ушедшая в DLQ, остаётся `PENDING`, её разбирает
+оператор. Если база была недоступна в момент приёма, задача всё равно в
+очереди, а строку создаст воркер — до этого GET отвечает 404.
+
+```bash
+curl -si -X POST localhost:8000/api/v1/tasks -H 'Content-Type: application/json' \
+  -d '{"url": "https://secure-login-paypal.example.com/verify/account"}'
+# HTTP/1.1 202 Accepted
+# location: http://localhost:8000/api/v1/tasks/c0aec273-9ba5-422f-8302-e14d12d4bfb1
+
+curl -s localhost:8000/api/v1/tasks/c0aec273-9ba5-422f-8302-e14d12d4bfb1
+```
+
+```json
+{"task_id":"c0aec273-9ba5-422f-8302-e14d12d4bfb1",
+ "url":"https://secure-login-paypal.example.com/verify/account","source":"api",
+ "status":"DONE","is_phishing":true,"phishing_probability":0.9977993369102478,
+ "model_version":"1","enqueued_at":"2026-10-20T16:35:55.193645Z",
+ "completed_at":"2026-10-20T16:35:55.429423Z"}
+```
 
 ## Проверки
 
@@ -59,7 +117,7 @@ uv run pre-commit run --all-files
 |---|---|
 | `lint` | `uv lock --check`, `ruff check`, `ruff format --check`, все хуки pre-commit |
 | `test` | pytest с покрытием (падает ниже 80%) |
-| `smoke` | поднимает MLflow, регистрирует игрушечную seed-модель как `@champion`, `docker compose up --wait`, запросы ко всем эндпоинтам на живом Postgres и проверка, что `/process` отвечает версией 1 |
+| `smoke` | поднимает MLflow, регистрирует игрушечную seed-модель как `@champion`, `docker compose up --wait` (API, RabbitMQ, воркер), запросы к эндпоинтам и задача через `POST /api/v1/tasks`, которая доходит до `DONE` с версией модели 1 |
 
 ### CD — `.github/workflows/cd.yml`
 
@@ -107,8 +165,9 @@ git push && git push --tags
 `X-Request-ID` и подмешивает во все записи лога этого запроса.
 
 Каждый запрос пишется одной строкой с методом, путём, статусом, временем
-ответа и IP клиента. Уровень зависит от ответа: 5xx — ERROR, 4xx — WARNING,
-остальное — INFO. Запрос, упавший с необработанным исключением, тоже пишется:
+ответа и IP клиента. Уровень зависит от ответа: 5xx — ERROR (кроме 503 с
+`Retry-After`: очередь заполнена, это штатный сброс нагрузки — WARNING),
+4xx — WARNING, остальное — INFO. Запрос, упавший с необработанным исключением, тоже пишется:
 на ERROR, с `exception=<тип>`, а traceback следом печатает uvicorn.
 Успешные запросы к `/healthz` пишутся на DEBUG — их каждые
 10 секунд делает Docker HEALTHCHECK. Access-лог uvicorn выключен: он дублировал
@@ -125,7 +184,7 @@ docker compose logs -f app
 ```
 Комп: training/*.py ── http://localhost:5050 ──┐
                                                ▼
-app (FastAPI) ── http://mlflow:5000 ──▶ mlflow (сервер + UI)
+worker ──────── http://mlflow:5000 ──▶ mlflow (сервер + UI)
                                         ├─▶ mlflow-db (Postgres): эксперименты, раны, метрики, реестр
                                         └─▶ s3 (RustFS, бакет mlflow): графики и модели
 ```
@@ -136,7 +195,8 @@ app (FastAPI) ── http://mlflow:5000 ──▶ mlflow (сервер + UI)
 | `mlflow-db` | — | Postgres, Backend Store: эксперименты, раны, метрики, реестр |
 | `s3` | http://localhost:9001 | RustFS, Artifact Store; веб-консоль `mlflow` / `mlflow-secret` |
 | `s3-init` | — | создаёт бакет `mlflow` и завершается с кодом 0 |
-| `app` | http://localhost:8000 | FastAPI, `POST /api/v1/process` |
+| `worker` | — | FastStream: загружает модель при старте, считает задачи из очереди |
+| `app` | http://localhost:8000 | FastAPI: `POST /api/v1/tasks`, `GET /api/v1/tasks/{task_id}` |
 | `postgres` | `localhost:5433` | Postgres приложения |
 
 Клиенты знают только адрес MLflow: файлы проксирует сервер, ключи от S3
@@ -146,7 +206,7 @@ app (FastAPI) ── http://mlflow:5000 ──▶ mlflow (сервер + UI)
 
 ```bash
 uv sync --all-groups                          # обычный `uv sync` удалит группу ml
-docker compose up -d --wait mlflow            # только MLflow (+ mlflow-db, s3): приложению пока нечего загружать
+docker compose up -d --wait mlflow            # только MLflow (+ mlflow-db, s3): воркеру пока нечего загружать
 uv run python -m training.download_data       # CSV в data/raw/ + проверка sha256
 
 uv run python -m training.eda                 # ран в эксперименте phiusiil-eda
@@ -158,33 +218,28 @@ uv run python -m training.registry register <run_id normalized>  # v2
 uv run python -m training.registry alias champion 2
 uv run python -m training.registry show
 
-docker compose up -d --build --wait           # приложение стартует, когда @champion уже есть
-curl -s -X POST localhost:8000/api/v1/process -H 'Content-Type: application/json' \
+docker compose up -d --build --wait           # воркер стартует, когда @champion уже есть
+curl -s -X POST localhost:8000/api/v1/tasks -H 'Content-Type: application/json' \
   -d '{"url": "https://secure-login-paypal.example.com/verify/account"}'
+curl -s localhost:8000/api/v1/tasks/<task_id из ответа>
 ```
 
-Приложение при старте один раз разрешает `phishing-url-clf@champion` в номер
-версии и загружает её. Если оно уже запущено (например, после быстрого старта),
-после `alias` нужен `docker compose up -d --build app` или `docker compose restart app`:
-без рестарта модель не перечитывается. Ответ при `@champion` → v2 (`normalized`) на запрос
-`{"url": "https://secure-login-paypal.example.com/verify/account"}`:
-
-```json
-{"url":"https://secure-login-paypal.example.com/verify/account","is_phishing":true,
- "phishing_probability":0.9979,"threshold":0.5,"model_name":"phishing-url-clf",
- "model_version":"2","model_alias":"champion"}
-```
+Воркер при старте один раз разрешает `phishing-url-clf@champion` в номер версии
+и загружает её. Если он уже запущен (например, после быстрого старта), после
+`alias` нужен `docker compose restart worker`: без рестарта модель не
+перечитывается. Результат задачи содержит `model_version` — версию, которая его
+посчитала (пример ответа — в разделе [Конвейер задач](#конвейер-задач)).
 
 Переключение версии без правки кода: `registry alias champion 1` и
-`docker compose restart app` (без пересборки) — в логе старта
-`Модель загружена: phishing-url-clf v1`, `/process` отвечает
+`docker compose restart worker` (без пересборки) — в логе старта
+`Воркер готов: модель phishing-url-clf v1 (@champion)`, новые задачи получают
 `"model_version":"1"`. `registry alias champion 2` и ещё один рестарт
-возвращают v2. Версия меняется только при старте приложения.
+возвращают v2. Версия меняется только при старте воркера.
 
 Модели `normalized`, `handcrafted` и `host-only` ссылаются на функции из
 `src/mlops_phishing/features.py`. Со старым образом без этого файла загрузка
-упадёт с `ModuleNotFoundError`: приложение стартует без модели, `/process`
-отвечает 503, причина в логе.
+упадёт с `ModuleNotFoundError`: воркер не стартует, причина в логе, задачи
+ждут в очереди.
 
 ### EDA
 
@@ -275,7 +330,9 @@ curl -s -X POST localhost:8000/api/v1/process -H 'Content-Type: application/json
   путь, но модель начинает считать фишингом бренды. Метрики падают на каждом
   шаге: это не регрессия, а честная оценка того, что URL сам по себе знает о
   фишинге в этом датасете.
-- **Горячее обновление по alias.** Переключить `@champion` и перезапустить
-  приложение — простой; реплики, перезапущенные в разное время, отдают разные
-  версии; новая версия может требовать новый код (`features.py`), то есть
-  модель и образ связаны.
+- **Горячее обновление по alias.** Переключить `@champion` и
+  `docker compose restart worker`: пока воркер стартует, обработка стоит, а API
+  продолжает принимать задачи — они ждут в очереди (до лимита, дальше 503 с
+  `Retry-After`); воркеры, перезапущенные в разное время, пишут разные
+  `model_version`; новая версия может требовать новый код (`features.py`), то
+  есть модель и образ связаны.

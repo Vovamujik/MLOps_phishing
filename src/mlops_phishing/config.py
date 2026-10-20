@@ -50,7 +50,7 @@ class Settings(BaseSettings):
     model_name: str = Field(default="phishing-url-clf", description="Имя модели в реестре.")
     model_alias: str = Field(
         default="champion",
-        description="Alias версии, которую обслуживает приложение. Смена — без правки кода.",
+        description="Alias версии, которую загружает воркер. Смена — без правки кода.",
     )
     phishing_threshold: float = Field(
         default=0.5,
@@ -76,6 +76,13 @@ class Settings(BaseSettings):
         default=3,
         gt=0,
         description="Сколько повторных доставок даётся задаче, прежде чем она уйдёт в DLQ.",
+    )
+    # Отказ при полной очереди приходит за миллисекунды. Таймаут нужен, если брокер завис
+    # или недоступен: клиент получает 503, а не висит
+    publish_timeout: float = Field(
+        default=2.0,
+        gt=0,
+        description="Сколько API ждёт брокер (соединение и подтверждение публикации), секунды.",
     )
 
     worker_pool_size: int = Field(

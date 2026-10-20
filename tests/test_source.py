@@ -13,31 +13,18 @@ from pathlib import Path
 from unittest import mock
 
 import pytest
-from aio_pika.exceptions import DeliveryError, PublishError
-from aiormq.abc import DeliveredMessage
+from aio_pika.exceptions import PublishError
 from faststream.rabbit import RabbitBroker, RabbitMessage, TestRabbitBroker
-from pamqp.commands import Basic
-from pamqp.header import ContentHeader
 
 from mlops_phishing import source
 from mlops_phishing.config import Settings
 from mlops_phishing.messaging import PUBLISH_CHANNEL, TASKS_QUEUE, TaskMessage
 from mlops_phishing.source import Backoff, Publish, Row, SourceStats, run_batch, task_id_for
 
+from .conftest import broker_nack, broker_return
+
 BATCH = "batch-1"
 HEADER = "FILENAME,URL,label\n"
-
-
-def nack() -> DeliveryError:
-    """Ответ брокера на публикацию в полную очередь (overflow=reject-publish)."""
-    return DeliveryError(None, Basic.Nack(delivery_tag=1))
-
-
-def unroutable() -> PublishError:
-    """Ответ брокера, когда очереди нет: сообщение вернулось отправителю."""
-    returned = Basic.Return(reply_code=312, reply_text="NO_ROUTE", exchange="", routing_key="tasks")
-    message = DeliveredMessage(delivery=returned, header=ContentHeader(), body=b"", channel=None)
-    return PublishError(message, returned)
 
 
 class FakeBroker:
@@ -55,7 +42,7 @@ class FakeBroker:
             raise self.error
         if self.full > 0:
             self.full -= 1
-            raise nack()
+            raise broker_nack()
         self.accepted.append(task)
 
 
@@ -196,7 +183,7 @@ async def test_enqueued_at_is_time_of_accepted_attempt():
 
 
 async def test_missing_queue_is_not_retried():
-    broker = FakeBroker(error=unroutable())
+    broker = FakeBroker(error=broker_return())
 
     with pytest.raises(PublishError):
         await publish_rows(make_rows(3), broker.publish)
@@ -220,7 +207,7 @@ async def test_stop_interrupts_backoff_and_keeps_resume_point():
 
     async def first_accepted_then_full(task: TaskMessage) -> None:
         if accepted:
-            raise nack()
+            raise broker_nack()
         accepted.append(task)
 
     stop = asyncio.Event()
@@ -328,7 +315,7 @@ async def test_run_stops_on_sigterm_and_logs_resume_point(tmp_path, caplog, monk
     async def first_accepted_then_sigterm(task: TaskMessage) -> None:
         if accepted:
             signal.raise_signal(signal.SIGTERM)
-            raise nack()
+            raise broker_nack()
         accepted.append(task)
 
     broker = RabbitBroker()
@@ -359,7 +346,7 @@ def test_main_requires_existing_file(tmp_path):
 
 def test_main_exits_when_queue_is_missing(tmp_path, monkeypatch):
     path = write_csv(tmp_path / "urls.csv", ["http://a.example/"])
-    monkeypatch.setattr(source, "run", mock.AsyncMock(side_effect=unroutable()))
+    monkeypatch.setattr(source, "run", mock.AsyncMock(side_effect=broker_return()))
 
     with pytest.raises(SystemExit) as exit_info:
         source.main(["--file", str(path)])
