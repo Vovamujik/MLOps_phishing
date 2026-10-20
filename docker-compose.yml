@@ -132,6 +132,29 @@ services:
         condition: service_completed_successfully
     logging: *default-logging
 
+  # Источник: пакетный скоринг CSV. В docker compose up не входит, запускается вручную:
+  # docker compose run --rm source --limit 2000
+  source:
+    image: mlops-phishing:local
+    profiles: ["source"]
+    entrypoint: ["python", "-m", "mlops_phishing.source"]
+    environment:
+      RABBITMQ_URL: amqp://${RABBITMQ_USER:-app}:${RABBITMQ_PASSWORD:-app}@rabbitmq:5672/
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      SOURCE_BACKOFF_INITIAL: ${SOURCE_BACKOFF_INITIAL:-0.05}
+      SOURCE_BACKOFF_MAX: ${SOURCE_BACKOFF_MAX:-1.0}
+    # CSV в образ не входит (.dockerignore), берём с хоста
+    volumes:
+      - ./data:/app/data:ro
+    # Healthcheck образа ждёт HTTP на :8000, у источника его нет
+    healthcheck:
+      disable: true
+    # Не rabbitmq-init: он перезапустился бы и вернул лимит очереди к значению из env
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    logging: *default-logging
+
   mlflow-db:
     image: postgres:16-alpine
     restart: unless-stopped

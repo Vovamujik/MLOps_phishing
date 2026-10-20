@@ -10,6 +10,7 @@ from datetime import datetime
 from typing import Literal
 
 from faststream.rabbit import QueueType, RabbitQueue
+from faststream.rabbit.schemas import Channel
 from pydantic import BaseModel, Field
 
 TASKS_QUEUE_NAME = "tasks"
@@ -18,6 +19,11 @@ DEAD_LETTER_QUEUE_NAME = "tasks.dlq"
 
 # Quorum: только у неё есть счётчик доставок (delivery-limit) для перехода в DLQ
 TASKS_QUEUE = RabbitQueue(TASKS_QUEUE_NAME, durable=True, queue_type=QueueType.QUORUM)
+
+# Канал издателей (источник, API). publisher_confirms: на каждую публикацию брокер отвечает
+# ack или nack, nack при полной очереди — DeliveryError. on_return_raises: если очереди нет,
+# брокер возвращает сообщение, и без флага FastStream молча считает его отправленным
+PUBLISH_CHANNEL = Channel(publisher_confirms=True, on_return_raises=True)
 
 
 class TaskMessage(BaseModel):

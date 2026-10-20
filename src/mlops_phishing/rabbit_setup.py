@@ -36,7 +36,9 @@ def tasks_policy(settings: Settings) -> dict[str, object]:
         "priority": 0,
         "definition": {
             "max-length": settings.tasks_queue_max_length,
-            # Сверх лимита брокер отвечает издателю nack: это и есть сигнал противодавления
+            # Сверх лимита брокер отвечает издателю nack: это и есть сигнал противодавления.
+            # Quorum-очередь включает отказ, когда готовых стало больше лимита (в UI видно
+            # max-length + 1), и снова принимает, когда их 80% лимита
             "overflow": "reject-publish",
             "delivery-limit": settings.tasks_delivery_limit,
             "dead-letter-exchange": DEAD_LETTER_EXCHANGE,
