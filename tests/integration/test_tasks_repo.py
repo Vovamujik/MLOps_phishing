@@ -6,7 +6,7 @@
 
 import asyncio
 import uuid
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 
 import asyncpg
@@ -15,20 +15,12 @@ import pytest
 from mlops_phishing import tasks_repo
 from mlops_phishing.tasks_repo import TaskResult, TaskStatus
 
-from .conftest import start_postgres
-
 pytestmark = pytest.mark.integration
 
 URL = "http://paypal-verify.example/login"
 NOW = datetime(2026, 10, 20, 12, 0, tzinfo=UTC)
 PHISHING = TaskResult(is_phishing=True, phishing_probability=0.97, model_version="2")
 LEGIT = TaskResult(is_phishing=False, phishing_probability=0.03, model_version="1")
-
-
-@pytest.fixture(scope="module")
-def postgres_dsn() -> Iterator[str]:
-    with start_postgres() as dsn:
-        yield dsn
 
 
 @pytest.fixture
