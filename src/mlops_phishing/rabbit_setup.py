@@ -29,21 +29,29 @@ QUORUM = {"x-queue-type": "quorum"}
 
 
 def tasks_policy(settings: Settings) -> dict[str, object]:
-    """Лимит готовых сообщений, отказ публикации сверх него, повторы и DLQ."""
-    return {
-        "pattern": f"^{TASKS_QUEUE_NAME}$",
-        "apply-to": "queues",
-        "priority": 0,
-        "definition": {
+    """Лимит готовых сообщений, отказ публикации сверх него, повторы и DLQ.
+
+    Лимит 0 — очередь без ограничения для эксперимента: повторы и DLQ остаются,
+    nack издателю нет, и очередь растёт, пока хватает ресурсов брокера.
+    """
+    definition: dict[str, object] = {
+        "delivery-limit": settings.tasks_delivery_limit,
+        "dead-letter-exchange": DEAD_LETTER_EXCHANGE,
+        "dead-letter-routing-key": DEAD_LETTER_QUEUE_NAME,
+    }
+    if settings.tasks_queue_max_length:
+        definition |= {
             "max-length": settings.tasks_queue_max_length,
             # Сверх лимита брокер отвечает издателю nack: это и есть сигнал противодавления.
             # Quorum-очередь включает отказ, когда готовых стало больше лимита (в UI видно
             # max-length + 1), и снова принимает, когда их 80% лимита
             "overflow": "reject-publish",
-            "delivery-limit": settings.tasks_delivery_limit,
-            "dead-letter-exchange": DEAD_LETTER_EXCHANGE,
-            "dead-letter-routing-key": DEAD_LETTER_QUEUE_NAME,
-        },
+        }
+    return {
+        "pattern": f"^{TASKS_QUEUE_NAME}$",
+        "apply-to": "queues",
+        "priority": 0,
+        "definition": definition,
     }
 
 
@@ -96,9 +104,9 @@ def apply_topology(settings: Settings, attempts: int = 30) -> None:
                 time.sleep(1)
         log.info("%s %s", method, path)
     log.info(
-        "Топология готова: %s (лимит %d, повторов %d) → %s",
+        "Топология готова: %s (лимит %s, повторов %d) → %s",
         TASKS_QUEUE_NAME,
-        settings.tasks_queue_max_length,
+        settings.tasks_queue_max_length or "нет",
         settings.tasks_delivery_limit,
         DEAD_LETTER_QUEUE_NAME,
     )

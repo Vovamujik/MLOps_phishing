@@ -67,9 +67,10 @@ class Settings(BaseSettings):
         default="http://localhost:15672",
         description="HTTP API управления RabbitMQ: через него задаётся топология очередей.",
     )
+    # 0 — очередь без лимита и без nack: режим «без противодавления», только для эксперимента
     tasks_queue_max_length: int = Field(
         default=100,
-        gt=0,
+        ge=0,
         description="Лимит готовых сообщений в очереди задач; сверх него брокер отвечает nack.",
     )
     tasks_delivery_limit: int = Field(

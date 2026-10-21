@@ -24,6 +24,17 @@ def test_policy_limits_queue_and_routes_failures_to_dlq():
     }
 
 
+def test_zero_limit_leaves_queue_unbounded_but_keeps_dlq():
+    """Режим эксперимента «без ограничений»: нет лимита и nack, повторы и DLQ на месте."""
+    policy = rabbit_setup.tasks_policy(Settings(tasks_queue_max_length=0, tasks_delivery_limit=2))
+
+    assert policy["definition"] == {
+        "delivery-limit": 2,
+        "dead-letter-exchange": "tasks.dlx",
+        "dead-letter-routing-key": "tasks.dlq",
+    }
+
+
 def test_dlq_exists_before_the_queue_that_dead_letters_into_it():
     """Иначе первое же «мёртвое» сообщение некуда было бы переложить."""
     paths = [path for _, path, _ in rabbit_setup.topology_requests(Settings())]
