@@ -31,6 +31,12 @@ def test_level_depends_on_status_and_path(path, status_code, expected):
     assert access_log_level(path, status_code) == expected
 
 
+def test_planned_load_shedding_is_a_warning_not_an_error():
+    """503 с Retry-After — очередь заполнена, штатная работа под нагрузкой, а не авария."""
+    assert access_log_level("/api/v1/tasks", 503, shedding=True) == logging.WARNING
+    assert access_log_level("/api/v1/tasks", 503) == logging.ERROR
+
+
 def test_liveness_probe_is_quiet():
     """Liveness дёргается оркестратором постоянно и не должен шуметь на INFO."""
     assert "/healthz" in QUIET_PATHS

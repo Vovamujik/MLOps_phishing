@@ -222,3 +222,6 @@ data/
 mlruns/
 mlartifacts/
 mlflow.db
+
+# Незавершённый прогон эксперимента (experiments.run пишет туда, пока не закончит)
+experiments/results/.*.partial/

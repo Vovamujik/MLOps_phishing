@@ -60,9 +60,10 @@ jobs:
         # Запас на скачивание образа MLflow (~380 MB) и его миграции на первом старте
         run: docker compose up -d --wait --wait-timeout 180 mlflow
       - name: Register seed model as champion
-        # MLflow в CI пустой: без модели приложение стартует без неё и /process не проверить
+        # MLflow в CI пустой: без модели воркер не стартует, и конвейер не проверить
         run: uv run python -m training.seed_ci_model
-      - name: Build & start app
+      - name: Build & start stack
+        # API, RabbitMQ и воркер; источник в профиле source и сам не стартует
         env:
           GIT_COMMIT: ${{ github.sha }}
         run: docker compose up -d --build --wait --wait-timeout 180
@@ -73,10 +74,17 @@ jobs:
           curl -fsS http://localhost:8000/healthz
           curl -fsS http://localhost:8000/api/v1/version | tee version.json
           curl -fsS http://localhost:8000/api/v1/health
-          curl -fsS -X POST http://localhost:8000/api/v1/process \
+          # Задача через очередь: 202 сразу, результат появится, когда воркер посчитает
+          curl -fsS -X POST http://localhost:8000/api/v1/tasks \
             -H 'Content-Type: application/json' \
-            -d '{"url": "http://paypal-secure-login.verify-account.xyz/signin"}' | tee process.json
-          python3 -c "import json; body = json.load(open('process.json')); assert body['model_version'] == '1', body"
+            -d '{"url": "http://paypal-secure-login.verify-account.xyz/signin"}' | tee accepted.json
+          status_url=$(python3 -c "import json; print(json.load(open('accepted.json'))['status_url'])")
+          for _ in $(seq 30); do
+            curl -fsS "$status_url" | tee task.json
+            python3 -c "import json, sys; sys.exit(json.load(open('task.json'))['status'] != 'DONE')" && break
+            sleep 1
+          done
+          python3 -c "import json; body = json.load(open('task.json')); assert body['status'] == 'DONE' and body['model_version'] == '1', body"
       - name: Compose logs
         if: always()
         run: docker compose logs
