@@ -8,6 +8,7 @@ import threading
 import tomllib
 from collections.abc import AsyncIterator, Callable, Iterator
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -28,7 +29,7 @@ from mlops_phishing.messaging import TaskMessage
 from mlops_phishing.metadata import get_version
 from mlops_phishing.ml import LoadedModel
 
-from . import SPANS
+from . import METRICS, SPANS
 
 PYPROJECT = Path(__file__).resolve().parents[1] / "pyproject.toml"
 
@@ -205,6 +206,29 @@ def span_named(exporter: InMemorySpanExporter, name: str) -> ReadableSpan:
     """Единственный законченный спан с таким именем."""
     [span] = [span for span in exporter.get_finished_spans() if span.name == name]
     return span
+
+
+def metric_points(name: str, **attributes: object) -> list[Any]:
+    """Точки метрики (кумулятивные, с начала прогона) с заданными атрибутами."""
+    data = METRICS.get_metrics_data()
+    points = [
+        point
+        for resource in (data.resource_metrics if data else [])
+        for scope in resource.scope_metrics
+        for metric in scope.metrics
+        if metric.name == name
+        for point in metric.data.data_points
+    ]
+    return [p for p in points if all(p.attributes.get(k) == v for k, v in attributes.items())]
+
+
+def metric_value(name: str, **attributes: object) -> float:
+    """Сумма счётчика; тесты сравнивают до и после, метрики копятся за весь прогон."""
+    return sum(point.value for point in metric_points(name, **attributes))
+
+
+def histogram_count(name: str, **attributes: object) -> int:
+    return sum(point.count for point in metric_points(name, **attributes))
 
 
 @pytest.fixture

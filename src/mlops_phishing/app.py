@@ -15,7 +15,7 @@ from fastapi import FastAPI, Request
 from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 from starlette.responses import Response
 
-from mlops_phishing import db, logging_config, tasks_repo, telemetry
+from mlops_phishing import db, instruments, logging_config, tasks_repo, telemetry
 from mlops_phishing.api.router import API_V1_PREFIX, root_router
 from mlops_phishing.api.system import LIVENESS_PATH
 from mlops_phishing.config import get_settings
@@ -158,6 +158,7 @@ def create_app() -> FastAPI:
 
     app.include_router(root_router)
     app.state.telemetry = tracing
+    instruments.observe_queue_limit(settings.tasks_queue_max_length)
     # Спан на запрос; внутренние спаны ASGI send/receive — шум, их не пишем
     FastAPIInstrumentor.instrument_app(
         app, excluded_urls=TRACE_EXCLUDED_URLS, exclude_spans=["receive", "send"]

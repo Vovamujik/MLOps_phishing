@@ -57,7 +57,7 @@ from opentelemetry import context as otel_context
 from opentelemetry import trace
 from pydantic import ValidationError
 
-from mlops_phishing import logging_config, telemetry
+from mlops_phishing import instruments, logging_config, telemetry
 from mlops_phishing.config import Settings, get_settings
 from mlops_phishing.messaging import (
     BROKER_LOGGER,
@@ -166,6 +166,8 @@ async def publish_confirmed(
             stats.nacked += 1
             delay = backoff.next_delay()
             stats.waited += delay
+            instruments.source_rejections.add(1)
+            instruments.source_backoff.add(delay)
             log.log(
                 logging.INFO if attempt == 1 else logging.DEBUG,
                 "Очередь заполнена, брокер отказал: пауза %.2f с перед попыткой %d",
@@ -180,6 +182,7 @@ async def publish_confirmed(
         else:
             backoff.reset()
             stats.published += 1
+            instruments.source_published.add(1)
             span.set_attribute("source.attempts", attempt)
             return True
 
@@ -366,7 +369,8 @@ def main(argv: list[str] | None = None) -> None:
         log.error("Очередь %s не существует: сначала поднимите rabbitmq-init", TASKS_QUEUE.name)
         raise SystemExit(1) from None
     finally:
-        # Процесс короткий: без явного сброса последние спаны остались бы в буфере
+        # Процесс короткий: без явного сброса последние спаны и срез метрик (экспорт
+        # раз в 5 с) остались бы в памяти, и короткая партия не попала бы на дашборд
         tracing.shutdown()
 
 

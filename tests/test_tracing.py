@@ -270,6 +270,8 @@ def fresh_otel(monkeypatch):
     installed: list[object] = []
     monkeypatch.setattr(telemetry.trace, "get_tracer_provider", trace.ProxyTracerProvider)
     monkeypatch.setattr(telemetry.trace, "set_tracer_provider", installed.append)
+    monkeypatch.setattr(telemetry.metrics, "set_meter_provider", installed.append)
+    monkeypatch.setattr(telemetry, "SystemMetricsInstrumentor", mock.Mock())
     monkeypatch.setattr(logging.getLogger(), "handlers", [logging.StreamHandler()])
     return installed
 
@@ -288,8 +290,10 @@ def test_dead_collector_does_not_block_exit(fresh_otel, monkeypatch):
     monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:59996")
 
     tracing = telemetry.setup_telemetry("source")
-    [provider] = fresh_otel
-    assert tracing.owned == [provider]
+    provider, meter_provider = fresh_otel
+    assert tracing.owned == [provider, meter_provider]
+    # Память и CPU процесса — только они, без системных метрик хоста
+    telemetry.SystemMetricsInstrumentor.assert_called_once_with(config=telemetry.PROCESS_METRICS)
     assert [type(f) for f in logging.getLogger().handlers[0].filters] == [
         telemetry.ExportLogThrottle
     ]
@@ -303,4 +307,5 @@ def test_dead_collector_does_not_block_exit(fresh_otel, monkeypatch):
     tracing.shutdown()
     tracing.shutdown()
 
-    assert time.perf_counter() - started < telemetry.SHUTDOWN_TIMEOUT_MS / 1000 + 2
+    # Трейсы и последний срез метрик — каждый не дольше таймаута экспорта
+    assert time.perf_counter() - started < 2 * telemetry.SHUTDOWN_TIMEOUT_MS / 1000 + 1

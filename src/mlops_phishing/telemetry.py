@@ -1,4 +1,4 @@
-"""OpenTelemetry: трейсы по OTLP/HTTP в Collector, настройка только из OTEL_*.
+"""OpenTelemetry: трейсы и метрики по OTLP/HTTP в Collector, настройка только из OTEL_*.
 
 Адресов в коде нет: endpoint, протокол, семплер и resource-атрибуты SDK читает из
 переменных окружения сам (OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_TRACES_SAMPLER,
@@ -18,8 +18,16 @@ Collector: держать все трейсы с ошибкой и медлен�
 Head-семплинг один терял бы большую часть ошибок, tail один — грузил бы Collector всем
 потоком спанов.
 
+Метрики — push тем же OTLP раз в OTEL_METRIC_EXPORT_INTERVAL: источник живёт минуты,
+pull-скрейп его бы не застал, а реплики воркера не нужно регистрировать в Prometheus.
+Границы гистограмм заданы явно (Views): API — вокруг задержки публикации и её таймаута
+2 с, inference — вокруг INFERENCE_DELAY_SECONDS из настроек, задача целиком — от
+долей секунды до минут ожидания в очереди. Память и CPU процесса — system-metrics,
+только process.memory.usage и process.cpu.time, без десятков системных метрик хоста.
+
 Collector недоступен: BatchSpanProcessor копит спаны в очереди (до 2048, лишнее
-отбрасывает) и отправляет из фонового потока — запросы приложения не ждут экспорта.
+отбрасывает) и отправляет из фонового потока — запросы приложения не ждут экспорта;
+метрики копятся в памяти (кумулятивно) и уйдут, когда Collector вернётся.
 Ошибка экспорта логируется не чаще раза в минуту (ExportLogThrottle), иначе каждый
 батч давал бы WARNING. При выходе shutdown отправляет остаток с коротким таймаутом.
 """
@@ -30,9 +38,14 @@ import socket
 import time
 from dataclasses import dataclass, field
 
-from opentelemetry import trace
+from opentelemetry import metrics, trace
+from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
 from opentelemetry.instrumentation.asyncpg import AsyncPGInstrumentor
+from opentelemetry.instrumentation.system_metrics import SystemMetricsInstrumentor
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.metrics.export import MetricReader, PeriodicExportingMetricReader
+from opentelemetry.sdk.metrics.view import DropAggregation, ExplicitBucketHistogramAggregation, View
 from opentelemetry.sdk.resources import (
     SERVICE_INSTANCE_ID,
     SERVICE_NAME,
@@ -56,6 +69,27 @@ EXPORT_LOG_INTERVAL = 60.0
 TRACER_NAME = "mlops_phishing"
 SEMCONV_OPT_IN = "OTEL_SEMCONV_STABILITY_OPT_IN"
 
+# Ответ API — публикация с подтверждением: миллисекунды, потолок — PUBLISH_TIMEOUT 2 с
+HTTP_DURATION_BUCKETS = (0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 2.5, 5.0)
+# Inference — доли от задержки модели: густо около неё, чтобы p95/p99 не слипались
+INFERENCE_SHARES = (0.25, 0.5, 0.75, 1.0, 1.025, 1.05, 1.1, 1.15, 1.25, 1.5, 2.0, 3.0, 5.0, 10.0)
+# Без задержки остаётся только модель: миллисекунды
+INFERENCE_FALLBACK_BUCKETS = (0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0)
+# Задача целиком — с ожиданием в очереди: при полной очереди это секунды и десятки секунд
+TASK_DURATION_BUCKETS = (0.25, 0.5, 1.0, 2.0, 3.0, 5.0, 7.5, 10.0, 15.0, 20.0, 30.0, 60.0, 120.0)
+# Метрики, которые дублируют наши или не нужны дашборду: лишние ряды без пользы
+DROPPED_METRICS = (
+    "messaging.publish.duration",
+    "messaging.process.duration",
+    "http.server.request.body.size",
+    "http.server.response.body.size",
+)
+# Память и CPU процесса; остальное system-metrics (диски, сеть хоста, gc) не нужно
+PROCESS_METRICS: dict[str, list[str] | None] = {
+    "process.memory.usage": None,
+    "process.cpu.time": ["user", "system"],
+}
+
 
 def is_disabled() -> bool:
     return os.environ.get("OTEL_SDK_DISABLED", "").strip().lower() == "true"
@@ -69,6 +103,36 @@ def build_resource(service: str) -> Resource:
         SERVICE_INSTANCE_ID: socket.gethostname(),
     }
     return Resource.create(defaults).merge(OTELResourceDetector().detect())
+
+
+def inference_buckets(delay: float) -> tuple[float, ...]:
+    """Границы гистограммы inference под задержку модели из настроек."""
+    if delay <= 0:
+        return INFERENCE_FALLBACK_BUCKETS
+    return tuple(round(delay * share, 4) for share in INFERENCE_SHARES)
+
+
+def metric_views(inference_delay: float) -> list[View]:
+    histograms = {
+        "http.server.request.duration": HTTP_DURATION_BUCKETS,
+        "worker.inference.duration": inference_buckets(inference_delay),
+        "worker.task.duration": TASK_DURATION_BUCKETS,
+    }
+    views = [
+        View(instrument_name=name, aggregation=ExplicitBucketHistogramAggregation(bounds))
+        for name, bounds in histograms.items()
+    ]
+    views += [View(instrument_name=name, aggregation=DropAggregation()) for name in DROPPED_METRICS]
+    return views
+
+
+def build_meter_provider(
+    resource: Resource, readers: list[MetricReader], inference_delay: float
+) -> MeterProvider:
+    """MeterProvider с нашими границами бакетов; читатели — OTLP в проде, память в тестах."""
+    return MeterProvider(
+        resource=resource, metric_readers=readers, views=metric_views(inference_delay)
+    )
 
 
 class ExportLogThrottle(logging.Filter):
@@ -98,19 +162,23 @@ class Telemetry:
     тесты с in-memory экспортёром): закрывать чужой провайдер нельзя.
     """
 
-    owned: list[TracerProvider] = field(default_factory=list)
+    owned: list[TracerProvider | MeterProvider] = field(default_factory=list)
 
     def shutdown(self) -> None:
         """Отправить остаток и остановить фоновые потоки. Повторный вызов безопасен."""
+        # shutdown сам отправляет остаток: спаны из очереди, последний срез метрик —
+        # короткий источник успевает отчитаться. Каждый экспорт ограничен таймаутом
         for provider in self.owned:
-            provider.force_flush(SHUTDOWN_TIMEOUT_MS)
             provider.shutdown()
         self.owned.clear()
 
 
-def setup_telemetry(service: str, *, instrument_asyncpg: bool = False) -> Telemetry:
-    """Включить трейсинг для процесса. Идемпотентно: второй вызов вернёт уже настроенное.
+def setup_telemetry(
+    service: str, *, inference_delay: float = 0.0, instrument_asyncpg: bool = False
+) -> Telemetry:
+    """Включить трейсы и метрики процесса. Идемпотентно: второй вызов вернёт настроенное.
 
+    inference_delay: задержка модели из настроек — под неё границы гистограммы inference.
     instrument_asyncpg: спаны на каждый запрос к Postgres (текст запроса без параметров).
     """
     # Стабильные HTTP-конвенции: метрика http.server.request.duration в секундах и атрибуты
@@ -135,6 +203,12 @@ def setup_telemetry(service: str, *, instrument_asyncpg: bool = False) -> Teleme
         BatchSpanProcessor(OTLPSpanExporter(timeout=SHUTDOWN_TIMEOUT_MS / 1000))
     )
     trace.set_tracer_provider(tracer_provider)
+    # Интервал экспорта — из OTEL_METRIC_EXPORT_INTERVAL; временность по умолчанию
+    # кумулятивная — её и ждёт OTLP-приёмник Prometheus
+    reader = PeriodicExportingMetricReader(OTLPMetricExporter(timeout=SHUTDOWN_TIMEOUT_MS / 1000))
+    meter_provider = build_meter_provider(resource, [reader], inference_delay)
+    metrics.set_meter_provider(meter_provider)
+    SystemMetricsInstrumentor(config=PROCESS_METRICS).instrument(meter_provider=meter_provider)
     if instrument_asyncpg:
         enable_asyncpg_spans()
     log.info(
@@ -142,7 +216,7 @@ def setup_telemetry(service: str, *, instrument_asyncpg: bool = False) -> Teleme
         resource.attributes.get(SERVICE_NAME),
         extra={"service_instance_id": resource.attributes.get(SERVICE_INSTANCE_ID)},
     )
-    return Telemetry(owned=[tracer_provider])
+    return Telemetry(owned=[tracer_provider, meter_provider])
 
 
 def enable_asyncpg_spans() -> None:
