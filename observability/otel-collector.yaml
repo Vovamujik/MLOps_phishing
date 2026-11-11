@@ -1,0 +1,69 @@
+# OpenTelemetry Collector: единая точка приёма OTLP от api / worker / source.
+# Трейсы → Tempo, метрики → OTLP receiver Prometheus. Приложение знает только адрес Collector.
+
+receivers:
+  otlp:
+    protocols:
+      # Приложение шлёт OTLP/HTTP (OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf)
+      http:
+        endpoint: 0.0.0.0:4318
+      # gRPC — для сторонних клиентов (telemetrygen и т. п.)
+      grpc:
+        endpoint: 0.0.0.0:4317
+
+processors:
+  # Порядок важен: memory_limiter ПЕРВЫЙ. Он смотрит на память процесса и при подходе к лимиту
+  # отказывает приёмнику (SDK получает ошибку и ретраит или сбрасывает данные у себя). Если бы
+  # первым стоял batch, данные уже лежали бы в его буфере в памяти — лимитер не смог бы их
+  # не принять, и Collector упал бы по OOM. batch после лимитера копит то, что уже разрешено
+  # принять, и отправляет пачками: меньше запросов к Tempo и Prometheus.
+  memory_limiter:
+    check_interval: 1s
+    # mem_limit контейнера 160 MiB: оставляем запас на рантайм Go
+    limit_mib: 120
+    spike_limit_mib: 30
+  batch:
+    send_batch_size: 1024
+    send_batch_max_size: 2048
+    # Метрики приходят раз в 5 с, задержка батча должна быть заметно меньше
+    timeout: 1s
+
+exporters:
+  otlp_grpc/tempo:
+    endpoint: tempo:4317
+    tls:
+      insecure: true
+    # Tempo не запущен (профиль metrics) — очередь ограничена, лишнее отбрасывается,
+    # приложение это не тормозит: оно уже отдало данные Collector
+    sending_queue:
+      queue_size: 500
+  otlp_http/prometheus:
+    # Exporter сам добавит /v1/metrics → /api/v1/otlp/v1/metrics
+    endpoint: http://prometheus:9090/api/v1/otlp
+    tls:
+      insecure: true
+    sending_queue:
+      queue_size: 500
+
+extensions:
+  # HTTP 200 на :13133 — для healthcheck контейнера
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+service:
+  extensions: [health_check]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlp_grpc/tempo]
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlp_http/prometheus]
+  telemetry:
+    logs:
+      level: warn
+      encoding: json
+    metrics:
+      level: none

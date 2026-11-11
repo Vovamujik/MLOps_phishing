@@ -1,0 +1,105 @@
+// Grafana Alloy: stdout контейнеров проекта → Loki.
+// Приложение пишет JSON-строку в stdout и не знает, куда она уйдёт; всё остальное — здесь.
+
+// Только контейнеры этого compose-проекта: чужие контейнеры на машине разработчика
+// (и их секреты в логах) в хранилище не попадают
+discovery.docker "project" {
+  host             = "unix:///var/run/docker.sock"
+  refresh_interval = "5s"
+
+  filter {
+    name   = "label"
+    values = [string.format("com.docker.compose.project=%s", sys.env("COMPOSE_PROJECT"))]
+  }
+}
+
+// Стартовые лейблы потока: service = имя compose-сервиса, env = окружение стенда.
+// Для логов приложения их перезапишут поля JSON (service=api у compose-сервиса app)
+discovery.relabel "project" {
+  targets = discovery.docker.project.targets
+
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
+    target_label  = "service"
+  }
+
+  rule {
+    target_label = "env"
+    replacement  = sys.env("STACK_ENV")
+  }
+}
+
+loki.source.docker "project" {
+  host             = "unix:///var/run/docker.sock"
+  targets          = discovery.relabel.project.output
+  refresh_interval = "5s"
+  forward_to       = [loki.process.pipeline.receiver]
+}
+
+loki.process "pipeline" {
+  // Docker отдаёт логи контейнера с самого начала. Старше retention Loki (48 ч) всё равно
+  // не примет — отбрасываем здесь, без ошибок 400 на каждой пачке
+  stage.drop {
+    older_than          = "47h"
+    drop_counter_reason = "older_than_retention"
+  }
+
+  // Логи приложения — JSON. Не-JSON строки (rabbitmq, postgres, mlflow) этот шаг пропускает
+  // без ошибки, и они идут дальше как есть
+  stage.json {
+    expressions = {
+      json_level = "level",
+      service    = "service",
+      env        = "env",
+      task_id    = "task_id",
+      trace_id   = "trace_id",
+    }
+  }
+
+  // Уровень текстовых логов: первое слово-уровень в начале строки ("[info]", "| INFO |",
+  // "ERROR:"). ESC-последовательность цвета перед словом (логи FastStream) тоже допускается
+  stage.regex {
+    expression = "(?i)^.{0,80}?(?:^|[^a-z]|\\x1b\\[[0-9;]*m)(?P<text_level>debug|info|notice|warn|warning|error|err|critical|crit|fatal|panic)(?:[^a-z]|$)"
+  }
+
+  // Единый словарь уровней: lowercase, warn → warning, fatal/panic → critical, иначе unknown
+  stage.template {
+    source   = "level"
+    template = "{{ $l := ToLower (or .json_level .text_level \"unknown\") }}{{ if eq $l \"warn\" }}warning{{ else if eq $l \"notice\" }}info{{ else if eq $l \"err\" }}error{{ else if or (eq $l \"crit\") (eq $l \"fatal\") (eq $l \"panic\") }}critical{{ else }}{{ $l }}{{ end }}"
+  }
+
+  // Лейблы (потоки) — только низкой кардинальности: несколько сервисов × 6 уровней × 1 env.
+  // Пустые значения (поля нет в JSON) лейбл не трогают — остаётся имя compose-сервиса
+  stage.labels {
+    values = {
+      service = "",
+      level   = "",
+      env     = "",
+    }
+  }
+
+  // task_id и trace_id — НЕ лейблы. Каждый лейбл с новым значением создаёт новый поток
+  // со своим индексом и чанками: 6000 задач = 6000 потоков по одной строке. Индекс Loki
+  // раздуется, ingester упрётся в лимит потоков, запросы станут медленнее. Structured
+  // metadata хранится рядом со строкой и всё равно фильтруется: {service="worker"} | task_id="…"
+  stage.structured_metadata {
+    values = {
+      task_id  = "",
+      trace_id = "",
+    }
+  }
+
+  // Страховка: на выходе только service, level, env — что бы ни добавили выше
+  stage.label_keep {
+    values = ["service", "level", "env"]
+  }
+
+  // Строку не меняем: в Loki лежит исходный JSON со всеми полями события
+  forward_to = [loki.write.default.receiver]
+}
+
+loki.write "default" {
+  endpoint {
+    url = "http://loki:3100/loki/api/v1/push"
+  }
+}
