@@ -586,6 +586,23 @@ sum(rate(worker_task_duration_seconds_bucket{job="worker", le="10"}[5m]))
 есть healthcheck. У Loki, Tempo и Collector в образах нет shell, поэтому их
 healthcheck — статический busybox из одноразового сервиса `hc-tools`.
 
+### Сценарии защиты
+
+Скрипты в [`demo/`](demo/) создают ситуацию и печатают, где искать её след:
+
+```bash
+uv run python -m demo.poison              # битое сообщение в tasks → DLQ с первой попытки, алерт DLQ
+uv run python -m demo.flood --requests 300  # поток POST при полной очереди: коды, Retry-After, request_id 503
+uv run python -m demo.series --rows 6000  # ряды метрик сейчас и с лейблом task_id
+```
+
+На стенде (очередь у лимита): `flood` — 105 ответов 202 и 195 ответов 503 с
+`Retry-After: 1` за 0.6 с, по `request_id` отказа в Loki находится запись с
+`trace_id`; `series` — 102 ряда сейчас, с `task_id` после 6000 строк добавится
+≈ 318 тыс. (гистограмма inference — 6000 × 17 = 102 тыс.). Повторы до
+delivery-limit и DLQ показывает остановленный Postgres: `docker compose stop
+postgres`, затем задача через API.
+
 ### Ограничения
 
 - `docker compose down -v` стирает и реестр MLflow: перед воркером нужна

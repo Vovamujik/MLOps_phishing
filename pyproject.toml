@@ -105,7 +105,7 @@ ignore = [
 "tests/**" = ["ANN", "S101"]
 
 [tool.ruff.lint.isort]
-known-first-party = ["mlops_phishing", "training", "experiments"]
+known-first-party = ["mlops_phishing", "training", "experiments", "demo"]
 
 [tool.ruff.format]
 quote-style = "double"
