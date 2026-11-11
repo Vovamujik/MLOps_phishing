@@ -1,0 +1,130 @@
+# Правила Grafana Alerting. Доставка (Telegram и т. п.) не настроена: на стенде достаточно
+# состояния Firing в UI (Alerting → Alert rules) и на панели дашборда.
+apiVersion: 1
+
+groups:
+  - orgId: 1
+    name: pipeline
+    # Отдельная папка: папку дашбордов создаёт provider с фиксированным UID, общий title
+    # с ней дал бы гонку при старте
+    folder: Алерты конвейера
+    # Метрики обновляются раз в 5 с (scrape и экспорт OTLP); 10 с — минимальный интервал
+    # оценки в Grafana, чаще смысла нет
+    interval: 10s
+    rules:
+      - uid: tasks-queue-full
+        title: Очередь tasks заполнена более чем на 90%
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 60
+              to: 0
+            datasourceUid: prometheus
+            model:
+              refId: A
+              # Ready-сообщения: лимит x-max-length считает только их (unacked не входят).
+              # Лимит — метрика API tasks_queue_limit из тех же настроек, что применяет
+              # rabbitmq-init; если API не прислал её, берём значение по умолчанию 100.
+              # max_over_time за 30 с: при reject-publish очередь пилит между 80% (там она
+              # снова принимает) и лимитом, и отдельный скрейп попадает то на 75, то на 101.
+              # Мгновенное значение каждые полминуты проваливалось ниже 90% и сбрасывало for:
+              # на прогоне 3000 задач алерт так и не дошёл до Firing. Максимум за окно
+              # отвечает на вопрос «упиралась ли очередь в лимит в последние 30 с»
+              expr: >-
+                max(max_over_time(rabbitmq_detailed_queue_messages_ready{queue="tasks"}[30s]))
+                / (max(tasks_queue_limit) or vector(100))
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+          - refId: C
+            datasourceUid: __expr__
+            relativeTimeRange:
+              from: 0
+              to: 0
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    # 90%, а не 100%: при reject-publish глубина пилит у самого лимита
+                    # (воркер забрал — источник тут же дописал) и в момент скрейпа редко
+                    # ровно равна лимиту. Выше 90% — очередь фактически упёрлась в лимит,
+                    # и источник уже получает отказы
+                    params: [0.9]
+        # Минута: короткий всплеск пачки источника (очередь наполнилась и за секунды
+        # разобралась) — нормальная работа буфера, не повод будить. Если очередь держится
+        # у лимита дольше минуты — воркеры системно не успевают, нужен ещё воркер.
+        # Окно 30 с + for 1m: очередь должна упираться в лимит в каждом полуминутном
+        # окне на протяжении минуты — одиночный выброс алерт не поднимет
+        for: 1m
+        # Нет данных (RabbitMQ или скрейп недоступны) — не про переполнение; это видно
+        # по up{job="rabbitmq"}
+        noDataState: OK
+        execErrState: Error
+        labels:
+          severity: warning
+          queue: tasks
+        annotations:
+          __dashboardUid__: pipeline
+          __panelId__: "1"
+          summary: Очередь tasks заполнена на {{ humanizePercentage $values.A.Value }} дольше минуты
+          description: >-
+            Воркеры не успевают за источником: брокер отклоняет публикации (reject-publish),
+            API отвечает 503. Проверьте пропускную способность воркеров и добавьте реплику:
+            docker compose up -d --scale worker=2
+
+      - uid: tasks-dlq-growth
+        title: В DLQ появились сообщения
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: prometheus
+            model:
+              refId: A
+              # Рост глубины tasks.dlq за 5 минут (delta — для gauge). Не «глубина > 0»:
+              # старые сообщения в DLQ держали бы алерт в Firing вечно, и новое «ядовитое»
+              # сообщение было бы не видно. Окно 5 мин держит алерт после события
+              expr: max(delta(rabbitmq_detailed_queue_messages{queue="tasks.dlq"}[5m]))
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+          - refId: C
+            datasourceUid: __expr__
+            relativeTimeRange:
+              from: 0
+              to: 0
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    # Любое новое сообщение: в DLQ задача попадает только после
+                    # delivery-limit (3) неудачных попыток, это уже не флуктуация, а потерянная
+                    # задача, которую надо разобрать руками
+                    params: [0]
+        # 30 с, не 0: два-три скрейпа подтверждают рост и отсекают артефакт одного скрейпа
+        # (например, пересоздание ряда после рестарта RabbitMQ). Дребезга нет и при большем
+        # интервале: условие держится всё 5-минутное окно delta
+        for: 30s
+        noDataState: OK
+        execErrState: Error
+        labels:
+          severity: critical
+          queue: tasks.dlq
+        annotations:
+          __dashboardUid__: pipeline
+          __panelId__: "1"
+          summary: В tasks.dlq за 5 минут добавилось сообщений — {{ humanize $values.A.Value }}
+          description: >-
+            Задачи исчерпали попытки доставки. Найдите их в логах:
+            {service="worker", level="error"} и событие перевода в DLQ, затем трейс по trace_id.

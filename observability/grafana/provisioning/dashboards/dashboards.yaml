@@ -1,0 +1,16 @@
+# Дашборды из JSON в репозитории. Правки в UI сохранить нельзя (allowUiUpdates: false):
+# источник истины — файл, иначе после down -v правка молча пропадёт.
+apiVersion: 1
+
+providers:
+  - name: pipeline
+    orgId: 1
+    folder: MLOps phishing
+    folderUid: mlops-phishing
+    type: file
+    disableDeletion: true
+    allowUiUpdates: false
+    updateIntervalSeconds: 30
+    options:
+      path: /etc/grafana/dashboards
+      foldersFromFilesStructure: false
