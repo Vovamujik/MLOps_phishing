@@ -9,6 +9,7 @@ from unittest import mock
 import aio_pika
 import pytest
 from faststream.rabbit import RabbitBroker, RabbitMessage, TestRabbitBroker
+from faststream.rabbit.opentelemetry import RabbitTelemetryMiddleware
 
 from mlops_phishing import publisher as publisher_module
 from mlops_phishing.config import Settings
@@ -52,7 +53,10 @@ def test_publisher_opens_broker_with_confirming_channel(monkeypatch):
     monkeypatch.setattr(publisher_module, "RabbitBroker", open_broker)
     RabbitTaskPublisher(Settings())
 
-    assert opened == [{"default_channel": PUBLISH_CHANNEL, "logger": BROKER_LOGGER}]
+    [options] = opened
+    assert (options["default_channel"], options["logger"]) == (PUBLISH_CHANNEL, BROKER_LOGGER)
+    # traceparent в заголовках: воркер продолжит трейс издателя
+    assert [type(m) for m in options["middlewares"]] == [RabbitTelemetryMiddleware]
 
 
 async def test_publish_sends_task_with_its_id_to_tasks_queue():

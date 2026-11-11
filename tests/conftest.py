@@ -16,6 +16,8 @@ from aio_pika.exceptions import DeliveryError, PublishError
 from aiormq.abc import DeliveredMessage
 from asgi_lifespan import LifespanManager
 from httpx import ASGITransport, AsyncClient
+from opentelemetry.sdk.trace import ReadableSpan
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from pamqp.commands import Basic
 from pamqp.header import ContentHeader
 
@@ -25,6 +27,8 @@ from mlops_phishing.logging_config import build_formatter
 from mlops_phishing.messaging import TaskMessage
 from mlops_phishing.metadata import get_version
 from mlops_phishing.ml import LoadedModel
+
+from . import SPANS
 
 PYPROJECT = Path(__file__).resolve().parents[1] / "pyproject.toml"
 
@@ -187,6 +191,20 @@ class JsonLog:
     def find(self, message_part: str) -> list[dict[str, object]]:
         """Записи, в тексте которых есть подстрока."""
         return [r for r in self.records if message_part in str(r["message"])]
+
+
+@pytest.fixture
+def spans() -> Iterator[InMemorySpanExporter]:
+    """Спаны, законченные за время теста (провайдер с экспортом в память — tests/__init__)."""
+    SPANS.clear()
+    yield SPANS
+    SPANS.clear()
+
+
+def span_named(exporter: InMemorySpanExporter, name: str) -> ReadableSpan:
+    """Единственный законченный спан с таким именем."""
+    [span] = [span for span in exporter.get_finished_spans() if span.name == name]
+    return span
 
 
 @pytest.fixture

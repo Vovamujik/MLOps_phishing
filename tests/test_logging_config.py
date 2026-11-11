@@ -100,9 +100,11 @@ def test_library_loggers_write_through_root(monkeypatch):
     monkeypatch.setattr(faststream_logger, "handlers", [logging.StreamHandler()])
     monkeypatch.setattr(faststream_logger, "propagate", False)
 
+    monkeypatch.setattr(logging.getLogger("mlflow"), "propagate", False)
+
     setup_logging("INFO", "api", "development")
 
-    for name in ("uvicorn", "uvicorn.error", "faststream"):
+    for name in ("uvicorn", "uvicorn.error", "faststream", "mlflow"):
         assert logging.getLogger(name).handlers == []
         assert logging.getLogger(name).propagate is True
 

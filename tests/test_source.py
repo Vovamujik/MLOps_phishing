@@ -15,6 +15,7 @@ from unittest import mock
 import pytest
 from aio_pika.exceptions import PublishError
 from faststream.rabbit import RabbitBroker, RabbitMessage, TestRabbitBroker
+from faststream.rabbit.opentelemetry import RabbitTelemetryMiddleware
 
 from mlops_phishing import source
 from mlops_phishing.config import Settings
@@ -300,7 +301,10 @@ async def test_run_publishes_file_through_confirming_channel(tmp_path, caplog, m
     assert [task.task_id for task in received] == [task_id_for("b1", 2), task_id_for("b1", 3)]
     assert stats.last_row == 3
     # Без on_return_raises публикация в несуществующую очередь молча «удалась» бы
-    assert opened == [{"default_channel": PUBLISH_CHANNEL, "logger": BROKER_LOGGER}]
+    [options] = opened
+    assert (options["default_channel"], options["logger"]) == (PUBLISH_CHANNEL, BROKER_LOGGER)
+    # traceparent в заголовках: воркер продолжит трейс издателя
+    assert [type(m) for m in options["middlewares"]] == [RabbitTelemetryMiddleware]
     assert PUBLISH_CHANNEL.publisher_confirms and PUBLISH_CHANNEL.on_return_raises
     assert "Готово: отправлено 2" in caplog.text
     assert "Продолжить" not in caplog.text

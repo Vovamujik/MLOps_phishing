@@ -17,10 +17,16 @@ prefetch равен числу потоков пула: каждой взято�
 correlation_id) и номер попытки (из x-delivery-count quorum-очереди), поэтому они есть
 во всех записях обработчика без передачи руками. Он же логирует перевод в DLQ.
 
+Трейс: RabbitTelemetryMiddleware продолжает трейс издателя по traceparent из заголовков
+(спан process), внутри — ручные спаны inference и db.save_result. run_in_executor не
+копирует contextvars, поэтому inference запускается в копии контекста: иначе спан
+оказался бы корневым, а записи из потока — без task_id и trace_id.
+
 Запуск: faststream run mlops_phishing.worker:app --host 0.0.0.0 --port 8001
 """
 
 import asyncio
+import contextvars
 import json
 import logging
 import time
@@ -40,10 +46,11 @@ from faststream.exceptions import RejectMessage
 from faststream.message import StreamMessage
 from faststream.rabbit import RabbitBroker
 from faststream.rabbit.schemas import Channel
+from opentelemetry import trace
 
-from mlops_phishing import logging_config, ml, tasks_repo
+from mlops_phishing import logging_config, ml, tasks_repo, telemetry
 from mlops_phishing.config import Settings, get_settings
-from mlops_phishing.messaging import TASKS_QUEUE, TaskMessage
+from mlops_phishing.messaging import TASKS_QUEUE, TaskMessage, telemetry_middleware
 from mlops_phishing.tasks_repo import TaskResult
 
 log = logging.getLogger(__name__)
@@ -53,6 +60,9 @@ RETRYABLE_ERRORS = (asyncpg.PostgresError, OSError, TimeoutError)
 
 # Заголовок quorum-очереди: сколько раз задачу уже вернули (reject с возвратом)
 DELIVERY_COUNT_HEADER = "x-delivery-count"
+
+# Атрибут спана process: число возвратов задачи по данным брокера
+DELIVERY_COUNT_ATTRIBUTE = "messaging.rabbitmq.delivery_count"
 
 RawMessage = aio_pika.IncomingMessage
 ConsumeNext = Callable[[StreamMessage[RawMessage]], Awaitable[object]]
@@ -94,6 +104,13 @@ def delivery_count(headers: dict[str, Any] | None) -> int:
         return 0
 
 
+def mark_dead_lettered(reason: str) -> None:
+    """Перевод в DLQ на спане process: событие видно на таймлайне трейса."""
+    span = trace.get_current_span()
+    span.set_attribute("messaging.rabbitmq.dead_lettered", True)
+    span.add_event("dead_lettered", {"reason": reason, "queue": "tasks.dlq"})
+
+
 class TaskContextMiddleware(BaseMiddleware):
     """task_id и номер попытки — в contextvars на время сообщения; итог — в лог.
 
@@ -108,13 +125,14 @@ class TaskContextMiddleware(BaseMiddleware):
         self.state = state
         self.redeliveries = delivery_count(getattr(msg, "headers", None))
         self.attempt = self.redeliveries + 1
+        task_id = getattr(msg, "correlation_id", None) or getattr(msg, "message_id", None)
+        self.task_id = str(task_id) if task_id else None
         self._tokens: dict[str, Any] = {}
 
     async def on_receive(self) -> None:
-        task_id = getattr(self.msg, "correlation_id", None) or getattr(self.msg, "message_id", None)
         fields: dict[str, object] = {"attempt": self.attempt}
-        if task_id:
-            fields["task_id"] = str(task_id)
+        if self.task_id:
+            fields["task_id"] = self.task_id
         self._tokens = structlog.contextvars.bind_contextvars(**fields)
         log.debug("Задача получена")
         if self.redeliveries:
@@ -123,7 +141,16 @@ class TaskContextMiddleware(BaseMiddleware):
     async def consume_scope(  # type: ignore[override]
         self, call_next: ConsumeNext, msg: StreamMessage[RawMessage]
     ) -> object:
-        """Перевод в DLQ — ERROR: задача больше не повторится, нужен человек."""
+        """Перевод в DLQ — ERROR: задача больше не повторится, нужен человек.
+
+        Текущий спан здесь — process из RabbitTelemetryMiddleware: на него вешаем номер
+        попытки и task_id (по нему трейс ищется в Tempo), а при переводе в DLQ — событие.
+        """
+        span = trace.get_current_span()
+        span.set_attribute(DELIVERY_COUNT_ATTRIBUTE, self.redeliveries)
+        span.set_attribute("messaging.delivery.attempt", self.attempt)
+        if self.task_id:
+            span.set_attribute("task.id", self.task_id)
         try:
             return await call_next(msg)
         except RejectMessage as exc:
@@ -134,13 +161,16 @@ class TaskContextMiddleware(BaseMiddleware):
                 self.dead_letter("исчерпаны попытки")
             raise
         except Exception:
-            # Битое сообщение или ошибка в коде: reject без возврата, сразу в DLQ
+            # Битое сообщение или ошибка в коде: reject без возврата, сразу в DLQ.
+            # Исключение и статус ERROR спану process ставит RabbitTelemetryMiddleware
             self.state.stats.dead_lettered += 1
+            mark_dead_lettered("ошибка обработки")
             log.exception("Ошибка обработки, задача переведена в DLQ без повторов")
             raise
 
     def dead_letter(self, reason: str) -> None:
         self.state.stats.dead_lettered += 1
+        mark_dead_lettered(reason)
         log.error(
             "Задача переведена в DLQ: %s",
             reason,
@@ -161,12 +191,35 @@ def score(model: ml.LoadedModel, url: str, delay: float) -> float:
     """Inference в потоке пула. Задержка имитирует тяжёлую модель, задаётся конфигом.
 
     Вызывается только через run_in_executor: sleep здесь держит поток пула, а
-    не event loop, поэтому воркер в это время отвечает на /health.
+    не event loop, поэтому воркер в это время отвечает на /health. Спан inference —
+    дочерний к process, если поток запущен в копии контекста (см. process).
     """
-    probability = model.phishing_probability(url)
-    if delay > 0:
-        time.sleep(delay)
+    attributes = {
+        "model.name": model.name,
+        "model.alias": model.alias,
+        "model.version": model.version,
+    }
+    with telemetry.tracer().start_as_current_span("inference", attributes=attributes):
+        probability = model.phishing_probability(url)
+        if delay > 0:
+            time.sleep(delay)
     return probability
+
+
+async def save_result(pool: asyncpg.Pool, task: TaskMessage, result: TaskResult) -> bool:
+    """Запись результата в своём спане: ошибка базы видна в трейсе со статусом ERROR."""
+    attributes = {
+        "db.system.name": "postgresql",
+        "task.id": str(task.task_id),
+        "task.source": task.source,
+    }
+    with telemetry.tracer().start_as_current_span("db.save_result", attributes=attributes) as span:
+        written = await tasks_repo.save_result(
+            pool, task.task_id, task.url, task.source, task.enqueued_at, result
+        )
+        # False — повторная доставка уже готовой задачи
+        span.set_attribute("db.result.written", written)
+        return written
 
 
 async def process(state: WorkerState, task: TaskMessage) -> None:
@@ -177,8 +230,11 @@ async def process(state: WorkerState, task: TaskMessage) -> None:
     stats.in_flight += 1
     try:
         loop = asyncio.get_running_loop()
+        # Копия контекста: в потоке пула тот же текущий спан (process) и тот же task_id
+        context = contextvars.copy_context()
         probability = await loop.run_in_executor(
             state.executor,
+            context.run,
             score,
             state.model,
             task.url,
@@ -190,9 +246,7 @@ async def process(state: WorkerState, task: TaskMessage) -> None:
             model_version=state.model.version,
         )
         try:
-            written = await tasks_repo.save_result(
-                state.db_pool, task.task_id, task.url, task.source, task.enqueued_at, result
-            )
+            written = await save_result(state.db_pool, task, result)
         except RETRYABLE_ERRORS as exc:
             stats.retried += 1
             # Номер попытки и task_id — из contextvars (TaskContextMiddleware)
@@ -222,7 +276,9 @@ def build_worker(settings: Settings) -> Worker:
     broker = RabbitBroker(
         settings.rabbitmq_url,
         graceful_timeout=settings.worker_graceful_timeout,
-        middlewares=[task_context],
+        # Порядок важен: телеметрия снаружи, тогда TaskContextMiddleware работает внутри
+        # спана process и пишет в него попытку и DLQ, а записи лога получают trace_id
+        middlewares=[telemetry_middleware(), task_context],
         # Свои строки FastStream о каждом сообщении («Received», «Processed», ошибка со
         # стектрейсом) дублировали бы TaskContextMiddleware, где есть task_id и попытка
         logger=None,
@@ -316,5 +372,8 @@ def build_worker(settings: Settings) -> Worker:
 _settings = get_settings()
 # При импорте: `faststream run` пишет о старте раньше lifespan
 logging_config.setup_logging(_settings.log_level, "worker", _settings.environment)
+_telemetry = telemetry.setup_telemetry("worker", instrument_asyncpg=True)
 worker = build_worker(_settings)
+# После остановки брокера: спаны последних задач уходят в Collector
+worker.app.after_shutdown(_telemetry.shutdown)
 app = worker.app

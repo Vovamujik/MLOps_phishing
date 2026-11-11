@@ -23,6 +23,12 @@
 Пауза после nack — не rate limiting: без отказов источник публикует со скоростью
 подтверждений, темп задают ack брокера.
 
+Трейсы: у каждой задачи свой корневой трейс source.task, а не один на всю партию —
+трейс на тысячи спанов не открыть и не найти в нём задачу. Внутри — publish каждой
+попытки (FastStream пишет traceparent в заголовки, воркер продолжает этот трейс),
+отказ брокера — событие broker.rejected, пауза перед повтором — дочерний спан
+source.backoff с номером попытки и длительностью.
+
 task_id детерминирован (партия + номер строки): повторный запуск партии,
 например после падения, не задублирует результаты — воркер пишет их идемпотентно.
 
@@ -38,6 +44,7 @@ import signal
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Iterable, Iterator
+from contextlib import AbstractContextManager
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from itertools import islice
@@ -46,9 +53,11 @@ from pathlib import Path
 import structlog
 from aio_pika.exceptions import DeliveryError, PublishError
 from faststream.rabbit import RabbitBroker
+from opentelemetry import context as otel_context
+from opentelemetry import trace
 from pydantic import ValidationError
 
-from mlops_phishing import logging_config
+from mlops_phishing import logging_config, telemetry
 from mlops_phishing.config import Settings, get_settings
 from mlops_phishing.messaging import (
     BROKER_LOGGER,
@@ -56,6 +65,7 @@ from mlops_phishing.messaging import (
     TASKS_QUEUE,
     TaskMessage,
     publish_task,
+    telemetry_middleware,
 )
 
 # Не __name__: под python -m он равен __main__
@@ -142,6 +152,7 @@ async def publish_confirmed(
     на INFO (видно, когда источник упёрся в лимит и на сколько замедлился), остальные —
     на DEBUG: на каждый nack было бы 5–20 строк в секунду. Темп виден в отчёте раз в 5 с.
     """
+    span = trace.get_current_span()
     attempt = 0
     while True:
         attempt += 1
@@ -162,12 +173,22 @@ async def publish_confirmed(
                 attempt + 1,
                 extra={"attempt": attempt, "delay": round(delay, 3)},
             )
-            if await wait_or_stop(stop, delay):
+            span.add_event("broker.rejected", {"attempt": attempt, "delay_s": delay})
+            if await backoff_wait(stop, delay, attempt):
+                span.add_event("stopped")
                 return False
         else:
             backoff.reset()
             stats.published += 1
+            span.set_attribute("source.attempts", attempt)
             return True
+
+
+async def backoff_wait(stop: asyncio.Event, delay: float, attempt: int) -> bool:
+    """Пауза после отказа — отдельный спан: на таймлайне видно, сколько задача ждала."""
+    attributes = {"attempt": attempt, "delay_s": delay}
+    with telemetry.tracer().start_as_current_span("source.backoff", attributes=attributes):
+        return await wait_or_stop(stop, delay)
 
 
 async def run_batch(
@@ -187,11 +208,24 @@ async def run_batch(
             return False
         task_id = task_id_for(batch_id, row.number)
         # task_id и номер строки — во всех записях о строке; сам URL в лог не пишем
-        with structlog.contextvars.bound_contextvars(task_id=str(task_id), row=row.number):
+        with (
+            structlog.contextvars.bound_contextvars(task_id=str(task_id), row=row.number),
+            task_span(task_id, batch_id, row.number),
+        ):
             if not await publish_row(row, task_id, publish, backoff, stats, stop):
                 return False
         stats.last_row = row.number
     return True
+
+
+def task_span(task_id: uuid.UUID, batch_id: str, row: int) -> AbstractContextManager[trace.Span]:
+    """Корневой спан задачи: пустой родительский контекст — новый трейс на каждую строку."""
+    return telemetry.tracer().start_as_current_span(
+        "source.task",
+        context=otel_context.Context(),
+        kind=trace.SpanKind.PRODUCER,
+        attributes={"task.id": str(task_id), "source.batch_id": batch_id, "source.row": row},
+    )
 
 
 async def publish_row(
@@ -209,6 +243,7 @@ async def publish_row(
         )
     except ValidationError:
         stats.skipped += 1
+        trace.get_current_span().add_event("row.skipped")
         log.warning("Строка %d пропущена: URL пустой или длиннее лимита", row.number)
         return True
     return await publish_confirmed(task, publish, backoff, stats, stop)
@@ -268,7 +303,10 @@ async def run(args: argparse.Namespace, settings: Settings) -> SourceStats:
     status = "Прервано ошибкой"
     try:
         async with RabbitBroker(
-            settings.rabbitmq_url, default_channel=PUBLISH_CHANNEL, logger=BROKER_LOGGER
+            settings.rabbitmq_url,
+            default_channel=PUBLISH_CHANNEL,
+            logger=BROKER_LOGGER,
+            middlewares=[telemetry_middleware()],
         ) as broker:
             publish = broker_publisher(broker)
             done = await run_batch(rows, publish, batch_id, backoff, stop, stats)
@@ -321,11 +359,15 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit(f"Нет файла {args.file}: uv run python -m training.download_data")
     settings = get_settings()
     logging_config.setup_logging(settings.log_level, "source", settings.environment)
+    tracing = telemetry.setup_telemetry("source")
     try:
         asyncio.run(run(args, settings))
     except PublishError:
         log.error("Очередь %s не существует: сначала поднимите rabbitmq-init", TASKS_QUEUE.name)
         raise SystemExit(1) from None
+    finally:
+        # Процесс короткий: без явного сброса последние спаны остались бы в буфере
+        tracing.shutdown()
 
 
 if __name__ == "__main__":

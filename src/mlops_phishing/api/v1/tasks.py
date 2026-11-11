@@ -26,6 +26,8 @@ from datetime import UTC, datetime
 import structlog
 from aio_pika.exceptions import DeliveryError, PublishError
 from fastapi import APIRouter, HTTPException, Request, Response, status
+from opentelemetry import trace
+from opentelemetry.trace import StatusCode
 
 from mlops_phishing import tasks_repo
 from mlops_phishing.config import Settings
@@ -63,6 +65,12 @@ def retry_after_seconds(settings: Settings) -> int:
     return max(1, math.ceil(round(seconds, 3)))
 
 
+def mark_failed(span: trace.Span, exc: BaseException, reason: str) -> None:
+    """503 в трейсе: статус ERROR и само исключение брокера на спане запроса."""
+    span.record_exception(exc)
+    span.set_status(StatusCode.ERROR, reason)
+
+
 @router.post(
     "/tasks",
     status_code=status.HTTP_202_ACCEPTED,
@@ -83,10 +91,14 @@ async def create_task(payload: TaskCreate, request: Request, response: Response)
     # Все записи запроса дальше — с task_id; access-лог middleware берёт его из state
     structlog.contextvars.bind_contextvars(task_id=str(task.task_id))
     request.state.task_id = task.task_id
+    # По task.id трейс ищется в Tempo: {span.task.id = "..."}
+    span = trace.get_current_span()
+    span.set_attribute("task.id", str(task.task_id))
 
     try:
         await publisher.publish(task)
     except PublishError as exc:
+        mark_failed(span, exc, "очереди задач нет")
         log.error("Очереди задач нет: 503", exc_info=exc)
         raise HTTPException(
             status.HTTP_503_SERVICE_UNAVAILABLE, "Очередь задач не настроена"
@@ -95,6 +107,7 @@ async def create_task(payload: TaskCreate, request: Request, response: Response)
         # Брокер ответил nack: очередь полна. Ждать места нельзя — отказ сразу.
         # WARNING, а не ERROR: это штатный сброс нагрузки, но его должно быть видно
         seconds = retry_after_seconds(settings)
+        mark_failed(span, exc, "очередь заполнена")
         log.warning(
             "Очередь заполнена: 503, Retry-After %d с", seconds, extra={"retry_after": seconds}
         )
@@ -105,6 +118,7 @@ async def create_task(payload: TaskCreate, request: Request, response: Response)
         ) from exc
     except BROKER_ERRORS as exc:
         # После таймаута исход неизвестен: задача могла уйти (см. docstring модуля)
+        mark_failed(span, exc, "брокер недоступен")
         log.error("Брокер недоступен: 503", exc_info=exc)
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Брокер задач недоступен") from exc
 

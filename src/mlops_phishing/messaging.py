@@ -11,6 +11,7 @@ from datetime import datetime
 from typing import Literal
 
 from faststream.rabbit import QueueType, RabbitBroker, RabbitQueue
+from faststream.rabbit.opentelemetry import RabbitTelemetryMiddleware
 from faststream.rabbit.schemas import Channel
 from pydantic import BaseModel, Field
 
@@ -29,6 +30,16 @@ PUBLISH_CHANNEL = Channel(publisher_confirms=True, on_return_raises=True)
 # Служебные записи FastStream издателей: без явного логгера он заводит свой с текстовым
 # обработчиком, а этот пишет через корневой — в общий JSON
 BROKER_LOGGER = logging.getLogger("faststream.access.rabbit")
+
+
+def telemetry_middleware() -> RabbitTelemetryMiddleware:
+    """Трейсинг брокера: W3C traceparent в заголовках сообщения.
+
+    У издателя — спаны create/publish, у воркера — process, продолжающий трейс издателя:
+    задача из API или источника и её обработка — один трейс. Провайдер — глобальный
+    (telemetry.setup_telemetry), без него спаны no-op.
+    """
+    return RabbitTelemetryMiddleware()
 
 
 class TaskMessage(BaseModel):

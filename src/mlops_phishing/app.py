@@ -12,9 +12,10 @@ from contextlib import asynccontextmanager
 
 import structlog
 from fastapi import FastAPI, Request
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 from starlette.responses import Response
 
-from mlops_phishing import db, logging_config, tasks_repo
+from mlops_phishing import db, logging_config, tasks_repo, telemetry
 from mlops_phishing.api.router import API_V1_PREFIX, root_router
 from mlops_phishing.api.system import LIVENESS_PATH
 from mlops_phishing.config import get_settings
@@ -27,6 +28,8 @@ REQUEST_ID_HEADER = "X-Request-ID"
 
 # Пробы Docker и мониторинга: дёргаются постоянно, на INFO засоряли бы лог
 QUIET_PATHS = frozenset({LIVENESS_PATH, f"{API_V1_PREFIX}/health"})
+# Пробы и в трейсы не пишем: тысячи одинаковых трейсов без пользы (регулярки по URL)
+TRACE_EXCLUDED_URLS = ",".join(path.lstrip("/") + "$" for path in sorted(QUIET_PATHS))
 
 
 def access_log_level(path: str, status_code: int, shedding: bool = False) -> int:
@@ -92,6 +95,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         await app.state.publisher.close()
         await db.close_pool(app.state.db_pool)
         log.info("API остановлен")
+        # Последним: спаны остановки тоже должны уйти в Collector
+        app.state.telemetry.shutdown()
 
 
 def create_app() -> FastAPI:
@@ -99,6 +104,7 @@ def create_app() -> FastAPI:
     settings = get_settings()
     # При импорте, а не в lifespan: строки uvicorn о старте сервера идут раньше lifespan
     logging_config.setup_logging(settings.log_level, "api", settings.environment)
+    tracing = telemetry.setup_telemetry("api", instrument_asyncpg=True)
 
     app = FastAPI(
         title=settings.app_name,
@@ -151,6 +157,11 @@ def create_app() -> FastAPI:
         return response
 
     app.include_router(root_router)
+    app.state.telemetry = tracing
+    # Спан на запрос; внутренние спаны ASGI send/receive — шум, их не пишем
+    FastAPIInstrumentor.instrument_app(
+        app, excluded_urls=TRACE_EXCLUDED_URLS, exclude_spans=["receive", "send"]
+    )
     return app
 
 

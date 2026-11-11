@@ -15,7 +15,8 @@
   стандартным logging, поэтому библиотеки ничего не знают о формате.
 
 Контекст живёт в contextvars: request_id ставит middleware API, task_id — middleware
-воркера на время сообщения. Поля записи попадают в JSON из contextvars и из extra.
+воркера на время сообщения, trace_id/span_id — из текущего спана OpenTelemetry.
+Поля записи попадают в JSON из contextvars и из extra.
 Уровень задаёт LOG_LEVEL; хранилище логов приложение не знает — только stdout.
 """
 
@@ -29,10 +30,12 @@ from typing import Any
 
 import structlog
 import uvicorn.config
+from opentelemetry import trace
 from structlog.typing import EventDict, Processor, WrappedLogger
 
-# Библиотеки, которые ставят себе свои обработчики: их записи отправляем в корневой
-LIBRARY_LOGGERS = ("uvicorn", "uvicorn.error", "faststream", "faststream.access")
+# Библиотеки, которые ставят себе свои обработчики: их записи отправляем в корневой.
+# mlflow вешает текстовый обработчик при импорте (ml импортируется раньше настройки)
+LIBRARY_LOGGERS = ("uvicorn", "uvicorn.error", "faststream", "faststream.access", "mlflow")
 # Access-лог uvicorn дублирует middleware API, где есть request_id
 SILENCED_LOGGERS = ("uvicorn.access",)
 
@@ -55,6 +58,15 @@ def add_timestamp(_: WrappedLogger, __: str, event_dict: EventDict) -> EventDict
     """ISO-8601 в UTC с миллисекундами: так время сравнимо между контейнерами."""
     now = datetime.now(UTC)
     event_dict["timestamp"] = now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{now.microsecond // 1000:03d}Z"
+    return event_dict
+
+
+def add_trace_ids(_: WrappedLogger, __: str, event_dict: EventDict) -> EventDict:
+    """trace_id и span_id текущего спана: из лога одним кликом — в трейс в Tempo."""
+    context = trace.get_current_span().get_span_context()
+    if context.is_valid:
+        event_dict["trace_id"] = trace.format_trace_id(context.trace_id)
+        event_dict["span_id"] = trace.format_span_id(context.span_id)
     return event_dict
 
 
@@ -92,6 +104,7 @@ def build_formatter(service: str, env: str) -> structlog.stdlib.ProcessorFormatt
         structlog.stdlib.add_log_level,
         structlog.stdlib.add_logger_name,
         structlog.stdlib.ExtraAdder(),
+        add_trace_ids,
         add_timestamp,
         static_fields(service, env),
     ]
