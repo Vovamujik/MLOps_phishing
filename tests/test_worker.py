@@ -210,3 +210,109 @@ def test_score_adds_configured_delay():
 
     assert probability == pytest.approx(0.4)
     assert time.perf_counter() - started >= 0.05
+
+
+# --- Логи: контекст задачи, попытки, DLQ, остановка --------------------------
+
+
+def worker_records(json_log) -> list[dict[str, object]]:
+    return [r for r in json_log.records if r["logger"] == "mlops_phishing.worker"]
+
+
+@pytest.mark.usefixtures("acks")
+async def test_task_id_is_in_every_handler_record(worker, events, monkeypatch, json_log):
+    """task_id приходит из correlation_id и попадает в записи без передачи руками."""
+    monkeypatch.setattr(tasks_repo, "save_result", save_result_stub(events))
+    message = task_message()
+
+    async with TestRabbitBroker(worker.broker) as broker:
+        await broker.publish(message, queue=TASKS_QUEUE, correlation_id=message["task_id"])
+    worker_module.log.info("после задачи")
+
+    records = worker_records(json_log)
+    handled = [r for r in records if r["message"] != "после задачи"]
+    assert [r["message"] for r in handled] == ["Задача получена", "Задача обработана"]
+    assert {(r["task_id"], r["attempt"]) for r in handled} == {(message["task_id"], 1)}
+    assert handled[1]["model_version"] == "2"
+    [after] = json_log.find("после задачи")
+    assert "task_id" not in after
+
+
+@pytest.mark.usefixtures("acks")
+async def test_retry_is_a_warning_with_attempt_and_traceback(worker, events, monkeypatch, json_log):
+    monkeypatch.setattr(tasks_repo, "save_result", mock.AsyncMock(side_effect=OSError("down")))
+    message = task_message()
+
+    async with TestRabbitBroker(worker.broker) as broker:
+        await broker.publish(
+            message,
+            queue=TASKS_QUEUE,
+            correlation_id=message["task_id"],
+            headers={"x-delivery-count": 1},
+        )
+
+    [redelivery] = json_log.find("Повторная доставка")
+    [retry] = json_log.find("вернётся в очередь")
+    assert redelivery["level"] == "info"
+    assert (retry["level"], retry["attempt"], retry["task_id"]) == (
+        "warning",
+        2,
+        message["task_id"],
+    )
+    assert "OSError: down" in str(retry["exception"])
+    assert not json_log.find("DLQ")
+
+
+@pytest.mark.usefixtures("acks")
+async def test_last_allowed_attempt_logs_dlq_transfer(worker, events, monkeypatch, json_log):
+    """Возврат при x-delivery-count = delivery-limit — брокер переложит задачу в DLQ."""
+    monkeypatch.setattr(tasks_repo, "save_result", mock.AsyncMock(side_effect=OSError("down")))
+    limit = worker.state.settings.tasks_delivery_limit
+
+    async with TestRabbitBroker(worker.broker) as broker:
+        await broker.publish(task_message(), queue=TASKS_QUEUE, headers={"x-delivery-count": limit})
+
+    [dlq] = json_log.find("переведена в DLQ")
+    assert (dlq["level"], dlq["attempt"], dlq["delivery_limit"]) == ("error", limit + 1, limit)
+    assert worker.state.stats.dead_lettered == 1
+
+
+@pytest.mark.usefixtures("acks")
+async def test_malformed_message_logs_dlq_with_traceback(worker, events, json_log):
+    async with TestRabbitBroker(worker.broker) as broker:
+        with pytest.raises(ValidationError):
+            await broker.publish({"url": "no task id"}, queue=TASKS_QUEUE)
+
+    [dlq] = json_log.find("переведена в DLQ без повторов")
+    assert dlq["level"] == "error"
+    assert "ValidationError" in str(dlq["exception"])
+
+
+@pytest.mark.parametrize(
+    ("headers", "expected"),
+    [(None, 0), ({}, 0), ({"x-delivery-count": 2}, 2), ({"x-delivery-count": "bad"}, 0)],
+)
+def test_delivery_count_header(headers, expected):
+    assert worker_module.delivery_count(headers) == expected
+
+
+@pytest.mark.usefixtures("acks")
+async def test_startup_and_graceful_shutdown_are_logged(events, monkeypatch, json_log):
+    monkeypatch.setattr(ml, "load_model", lambda settings: make_model(version="7"))
+    pool = mock.AsyncMock()
+    monkeypatch.setattr(worker_module.asyncpg, "create_pool", mock.AsyncMock(return_value=pool))
+    built = build_worker(Settings(inference_delay_seconds=0))
+
+    async with TestRabbitBroker(built.broker), TestApp(built.app):
+        pass
+
+    [loaded] = json_log.find("Модель загружена")
+    assert (loaded["level"], loaded["model_alias"], loaded["model_version"]) == (
+        "info",
+        "champion",
+        "7",
+    )
+    [started] = json_log.find("Остановка воркера")
+    [finished] = json_log.find("Воркер остановлен")
+    assert (started["level"], started["in_flight"]) == ("info", 0)
+    assert (finished["level"], finished["in_flight"]) == ("info", 0)

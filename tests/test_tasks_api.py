@@ -160,6 +160,22 @@ async def test_url_is_not_logged(client, install_publisher, pending, caplog):
     assert URL not in caplog.text
 
 
+async def test_503_is_a_warning_with_task_id_in_every_request_record(
+    client, install_publisher, pending, json_log
+):
+    """Ответ 503 — WARNING; task_id в записи обработчика и в строке access-лога."""
+    publisher = install_publisher(FakePublisher(error=broker_nack()))
+
+    response = await client.post("/api/v1/tasks", json={"url": URL})
+
+    task_id = str(publisher.tasks[0].task_id)
+    [shed] = json_log.find("Очередь заполнена: 503")
+    [access] = json_log.find("POST /api/v1/tasks -> 503")
+    assert (shed["level"], shed["task_id"], shed["retry_after"]) == ("warning", task_id, 1)
+    assert (access["level"], access["task_id"]) == ("warning", task_id)
+    assert shed["request_id"] == access["request_id"] == response.headers["X-Request-ID"]
+
+
 @pytest.mark.parametrize(
     ("max_length", "delay", "pool_size", "prefetch", "expected"),
     [

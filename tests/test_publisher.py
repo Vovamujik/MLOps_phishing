@@ -12,7 +12,7 @@ from faststream.rabbit import RabbitBroker, RabbitMessage, TestRabbitBroker
 
 from mlops_phishing import publisher as publisher_module
 from mlops_phishing.config import Settings
-from mlops_phishing.messaging import PUBLISH_CHANNEL, TASKS_QUEUE, TaskMessage
+from mlops_phishing.messaging import BROKER_LOGGER, PUBLISH_CHANNEL, TASKS_QUEUE, TaskMessage
 from mlops_phishing.publisher import RabbitTaskPublisher
 
 from .conftest import DEAD_RABBITMQ_URL
@@ -52,7 +52,7 @@ def test_publisher_opens_broker_with_confirming_channel(monkeypatch):
     monkeypatch.setattr(publisher_module, "RabbitBroker", open_broker)
     RabbitTaskPublisher(Settings())
 
-    assert opened == [{"default_channel": PUBLISH_CHANNEL}]
+    assert opened == [{"default_channel": PUBLISH_CHANNEL, "logger": BROKER_LOGGER}]
 
 
 async def test_publish_sends_task_with_its_id_to_tasks_queue():

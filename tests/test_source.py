@@ -18,7 +18,7 @@ from faststream.rabbit import RabbitBroker, RabbitMessage, TestRabbitBroker
 
 from mlops_phishing import source
 from mlops_phishing.config import Settings
-from mlops_phishing.messaging import PUBLISH_CHANNEL, TASKS_QUEUE, TaskMessage
+from mlops_phishing.messaging import BROKER_LOGGER, PUBLISH_CHANNEL, TASKS_QUEUE, TaskMessage
 from mlops_phishing.source import Backoff, Publish, Row, SourceStats, run_batch, task_id_for
 
 from .conftest import broker_nack, broker_return
@@ -300,7 +300,7 @@ async def test_run_publishes_file_through_confirming_channel(tmp_path, caplog, m
     assert [task.task_id for task in received] == [task_id_for("b1", 2), task_id_for("b1", 3)]
     assert stats.last_row == 3
     # Без on_return_raises публикация в несуществующую очередь молча «удалась» бы
-    assert opened == [{"default_channel": PUBLISH_CHANNEL}]
+    assert opened == [{"default_channel": PUBLISH_CHANNEL, "logger": BROKER_LOGGER}]
     assert PUBLISH_CHANNEL.publisher_confirms and PUBLISH_CHANNEL.on_return_raises
     assert "Готово: отправлено 2" in caplog.text
     assert "Продолжить" not in caplog.text
@@ -352,3 +352,42 @@ def test_main_exits_when_queue_is_missing(tmp_path, monkeypatch):
         source.main(["--file", str(path)])
 
     assert exit_info.value.code == 1
+
+
+# --- Логи: task_id на строку, отказы брокера, остановка ----------------------
+
+
+async def test_nack_streak_logs_first_refusal_at_info_rest_at_debug(json_log):
+    """Отказ — штатное противодавление: одна INFO на серию с паузой, остальное DEBUG."""
+    broker = FakeBroker(full=3)
+
+    await publish_rows(make_rows(1), broker.publish)
+
+    refusals = json_log.find("брокер отказал")
+    assert [r["level"] for r in refusals] == ["info", "debug", "debug"]
+    assert [r["attempt"] for r in refusals] == [1, 2, 3]
+    assert all(r["delay"] > 0 for r in refusals)
+    assert {r["task_id"] for r in refusals} == {str(task_id_for(BATCH, 1))}
+
+
+async def test_row_records_carry_task_id_but_not_the_url(json_log):
+    rows = [Row(1, ""), Row(2, "http://secret-row.example/")]
+    broker = FakeBroker(full=1)
+
+    await publish_rows(rows, broker.publish)
+
+    [skipped] = json_log.find("пропущена")
+    [refused] = json_log.find("брокер отказал")
+    assert (skipped["task_id"], skipped["row"]) == (str(task_id_for(BATCH, 1)), 1)
+    assert (refused["task_id"], refused["row"]) == (str(task_id_for(BATCH, 2)), 2)
+    assert "secret-row" not in json_log.text
+
+
+def test_stop_signal_is_logged(json_log):
+    stop = asyncio.Event()
+
+    source.request_stop(stop, signal.SIGTERM)
+
+    assert stop.is_set()
+    [record] = json_log.find("Получен SIGTERM")
+    assert record["level"] == "info"

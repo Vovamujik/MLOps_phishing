@@ -13,7 +13,7 @@ from aio_pika.exceptions import ChannelInvalidStateError
 from faststream.rabbit import RabbitBroker
 
 from mlops_phishing.config import Settings
-from mlops_phishing.messaging import PUBLISH_CHANNEL, TaskMessage, publish_task
+from mlops_phishing.messaging import BROKER_LOGGER, PUBLISH_CHANNEL, TaskMessage, publish_task
 
 # Брокер недоступен или не ответил вовремя. Ошибки соединения aio-pika — подклассы OSError
 BROKER_ERRORS = (OSError, TimeoutError, ChannelInvalidStateError)
@@ -37,7 +37,9 @@ class TaskPublisher(Protocol):
 
 class RabbitTaskPublisher:
     def __init__(self, settings: Settings) -> None:
-        self.broker = RabbitBroker(settings.rabbitmq_url, default_channel=PUBLISH_CHANNEL)
+        self.broker = RabbitBroker(
+            settings.rabbitmq_url, default_channel=PUBLISH_CHANNEL, logger=BROKER_LOGGER
+        )
         self.timeout = settings.publish_timeout
         self._connecting: asyncio.Future[RobustConnection] | None = None
 

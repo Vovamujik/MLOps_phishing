@@ -18,6 +18,7 @@ dependencies = [
     "pandas>=2.2",
     "skops>=0.13",
     "faststream[cli,rabbit]>=0.7.7,<0.8",
+    "structlog>=25.1",
 ]
 
 [dependency-groups]

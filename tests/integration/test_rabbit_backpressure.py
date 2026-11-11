@@ -297,7 +297,7 @@ async def test_source_waits_on_full_queue_and_loses_nothing(settings, channel):
 
 
 async def test_failing_task_goes_to_dlq_after_delivery_limit(
-    start_worker, publisher, channel, monkeypatch
+    start_worker, publisher, channel, monkeypatch, json_log
 ):
     """База недоступна при каждой попытке: 1 + delivery-limit доставок, потом DLQ."""
     attempts: list[uuid.UUID] = []
@@ -319,6 +319,13 @@ async def test_failing_task_goes_to_dlq_after_delivery_limit(
     assert dead.headers["x-acquired-count"] == DELIVERY_LIMIT + 1
     assert dead.headers["x-first-death-reason"] == "delivery_limit"
     assert await depth(channel, TASKS_QUEUE_NAME) == 0
+    # Номер попытки — из x-delivery-count брокера, task_id — из correlation_id
+    retries = json_log.find("вернётся в очередь")
+    assert [(r["attempt"], r["task_id"]) for r in retries] == [
+        (attempt, str(task.task_id)) for attempt in range(1, DELIVERY_LIMIT + 2)
+    ]
+    [dlq] = json_log.find("переведена в DLQ")
+    assert (dlq["level"], dlq["attempt"]) == ("error", DELIVERY_LIMIT + 1)
 
 
 async def test_malformed_message_goes_to_dlq_without_retries(start_worker, channel, monkeypatch):

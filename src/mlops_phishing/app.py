@@ -10,11 +10,12 @@ import uuid
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import asynccontextmanager
 
+import structlog
 from fastapi import FastAPI, Request
 from starlette.responses import Response
 
 from mlops_phishing import db, logging_config, tasks_repo
-from mlops_phishing.api.router import root_router
+from mlops_phishing.api.router import API_V1_PREFIX, root_router
 from mlops_phishing.api.system import LIVENESS_PATH
 from mlops_phishing.config import get_settings
 from mlops_phishing.metadata import get_version
@@ -24,7 +25,8 @@ log = logging.getLogger(__name__)
 
 REQUEST_ID_HEADER = "X-Request-ID"
 
-QUIET_PATHS = frozenset({LIVENESS_PATH})
+# Пробы Docker и мониторинга: дёргаются постоянно, на INFO засоряли бы лог
+QUIET_PATHS = frozenset({LIVENESS_PATH, f"{API_V1_PREFIX}/health"})
 
 
 def access_log_level(path: str, status_code: int, shedding: bool = False) -> int:
@@ -44,6 +46,18 @@ def access_log_level(path: str, status_code: int, shedding: bool = False) -> int
     return logging.INFO
 
 
+def access_fields(request: Request, started_at: float, status_code: int) -> dict[str, object]:
+    """Поля строки access-лога: код, длительность и task_id, если запрос создал задачу."""
+    fields: dict[str, object] = {
+        "status_code": status_code,
+        "duration_ms": round((time.perf_counter() - started_at) * 1000, 1),
+    }
+    task_id = getattr(request.state, "task_id", None)
+    if task_id is not None:
+        fields["task_id"] = str(task_id)
+    return fields
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     """Жизненный цикл: пул БД и издатель задач при старте, закрыть их при остановке.
@@ -53,8 +67,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     приложение многократно. Модели в API нет: её грузит воркер.
     """
     settings = get_settings()
-    logging_config.setup_logging(settings.log_level)
-
     app.state.settings = settings
     app.state.db_pool = await db.create_pool(settings)
     app.state.publisher = RabbitTaskPublisher(settings)
@@ -75,14 +87,18 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     try:
         yield
     finally:
+        # uvicorn уже перестал принимать запросы и дождался текущих
+        log.info("Остановка API: закрываем соединения с брокером и базой")
         await app.state.publisher.close()
         await db.close_pool(app.state.db_pool)
-        log.info("Приложение остановлено")
+        log.info("API остановлен")
 
 
 def create_app() -> FastAPI:
     """Собрать и настроить приложение FastAPI."""
     settings = get_settings()
+    # При импорте, а не в lifespan: строки uvicorn о старте сервера идут раньше lifespan
+    logging_config.setup_logging(settings.log_level, "api", settings.environment)
 
     app = FastAPI(
         title=settings.app_name,
@@ -96,37 +112,40 @@ def create_app() -> FastAPI:
         request: Request,
         call_next: Callable[[Request], Awaitable[Response]],
     ) -> Response:
-        """Присвоить запросу идентификатор и залогировать его результат."""
+        """Присвоить запросу идентификатор и залогировать его результат.
+
+        request_id попадает в contextvars и оттуда во все записи запроса. task_id
+        обработчик кладёт в request.state: его contextvars в middleware не видны.
+        """
         request_id = uuid.uuid4().hex[:8]
-        token = logging_config.REQUEST_ID.set(request_id)
         started_at = time.perf_counter()
-        client = request.client.host if request.client else "-"
-        try:
-            response = await call_next(request)
-        except Exception as exc:
-            log.error(
-                "%s %s -> 500 (%.1f ms) client=%s exception=%s",
-                request.method,
-                request.url.path,
-                (time.perf_counter() - started_at) * 1000,
-                client,
-                type(exc).__name__,
-            )
-            raise
-        else:
+        fields: dict[str, object] = {
+            "method": request.method,
+            "path": request.url.path,
+            "client": request.client.host if request.client else "-",
+        }
+        with structlog.contextvars.bound_contextvars(request_id=request_id):
+            try:
+                response = await call_next(request)
+            except Exception as exc:
+                log.error(
+                    "%s %s -> 500",
+                    request.method,
+                    request.url.path,
+                    extra=fields | access_fields(request, started_at, 500),
+                    exc_info=exc,
+                )
+                raise
             log.log(
                 access_log_level(
                     request.url.path, response.status_code, "Retry-After" in response.headers
                 ),
-                "%s %s -> %d (%.1f ms) client=%s",
+                "%s %s -> %d",
                 request.method,
                 request.url.path,
                 response.status_code,
-                (time.perf_counter() - started_at) * 1000,
-                client,
+                extra=fields | access_fields(request, started_at, response.status_code),
             )
-        finally:
-            logging_config.REQUEST_ID.reset(token)
 
         response.headers[REQUEST_ID_HEADER] = request_id
         return response

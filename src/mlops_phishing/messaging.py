@@ -5,6 +5,7 @@
 политика переполнения и DLQ задаются policy (см. rabbit_setup).
 """
 
+import logging
 import uuid
 from datetime import datetime
 from typing import Literal
@@ -25,6 +26,10 @@ TASKS_QUEUE = RabbitQueue(TASKS_QUEUE_NAME, durable=True, queue_type=QueueType.Q
 # брокер возвращает сообщение, и без флага FastStream молча считает его отправленным
 PUBLISH_CHANNEL = Channel(publisher_confirms=True, on_return_raises=True)
 
+# Служебные записи FastStream издателей: без явного логгера он заводит свой с текстовым
+# обработчиком, а этот пишет через корневой — в общий JSON
+BROKER_LOGGER = logging.getLogger("faststream.access.rabbit")
+
 
 class TaskMessage(BaseModel):
     """Задача в очереди: одна URL-строка на скоринг."""
@@ -43,5 +48,10 @@ async def publish_task(broker: RabbitBroker, task: TaskMessage) -> None:
     очереди нет — PublishError (mandatory по умолчанию). persist для наглядности:
     quorum-очередь и так пишет всё на диск, а сохранность гарантирует confirm — ack
     приходит после записи на большинство узлов.
+
+    correlation_id = message_id = task_id: по нему воркер кладёт task_id в контекст логов.
     """
-    await broker.publish(task, queue=TASKS_QUEUE, message_id=str(task.task_id), persist=True)
+    task_id = str(task.task_id)
+    await broker.publish(
+        task, queue=TASKS_QUEUE, message_id=task_id, correlation_id=task_id, persist=True
+    )

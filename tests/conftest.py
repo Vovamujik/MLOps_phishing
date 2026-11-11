@@ -1,6 +1,8 @@
 """Общие фикстуры тестов."""
 
 import asyncio
+import io
+import json
 import logging
 import threading
 import tomllib
@@ -19,6 +21,7 @@ from pamqp.header import ContentHeader
 
 from mlops_phishing.app import app
 from mlops_phishing.config import Settings, get_settings
+from mlops_phishing.logging_config import build_formatter
 from mlops_phishing.messaging import TaskMessage
 from mlops_phishing.metadata import get_version
 from mlops_phishing.ml import LoadedModel
@@ -165,6 +168,42 @@ def restore_root_logger() -> Iterator[None]:
     yield
     root.handlers = handlers
     root.setLevel(level)
+
+
+class JsonLog:
+    """Записи логов в том виде, в каком их увидит Loki: разобранные JSON-строки."""
+
+    def __init__(self) -> None:
+        self.stream = io.StringIO()
+
+    @property
+    def records(self) -> list[dict[str, object]]:
+        return [json.loads(line) for line in self.stream.getvalue().splitlines()]
+
+    @property
+    def text(self) -> str:
+        return self.stream.getvalue()
+
+    def find(self, message_part: str) -> list[dict[str, object]]:
+        """Записи, в тексте которых есть подстрока."""
+        return [r for r in self.records if message_part in str(r["message"])]
+
+
+@pytest.fixture
+def json_log() -> Iterator[JsonLog]:
+    """Перехват логов через тот же JSON-форматтер, что у приложения, с уровня DEBUG.
+
+    Обработчик вешается на корневой логгер рядом с остальными; restore_root_logger
+    вернёт уровень после теста.
+    """
+    captured = JsonLog()
+    handler = logging.StreamHandler(captured.stream)
+    handler.setFormatter(build_formatter("test-service", "test"))
+    root = logging.getLogger()
+    root.addHandler(handler)
+    root.setLevel(logging.DEBUG)
+    yield captured
+    root.removeHandler(handler)
 
 
 @pytest.fixture

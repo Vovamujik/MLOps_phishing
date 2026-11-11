@@ -1,79 +1,130 @@
-"""Тесты настройки логирования."""
+"""Тесты логов: форма JSON, контекст, маскирование паролей, логгеры библиотек."""
 
 import logging
+import re
 
-from mlops_phishing.logging_config import (
-    NO_REQUEST_ID,
-    REQUEST_ID,
-    RequestIdFilter,
-    get_request_id,
-    setup_logging,
-)
+import structlog
+import uvicorn
 
+from mlops_phishing.logging_config import mask_credentials, setup_logging
 
-def make_record() -> logging.LogRecord:
-    """Собрать минимальную запись лога для проверки фильтра."""
-    return logging.LogRecord(
-        name="test",
-        level=logging.INFO,
-        pathname=__file__,
-        lineno=1,
-        msg="msg",
-        args=(),
-        exc_info=None,
-    )
+TIMESTAMP = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$")
+log = logging.getLogger("mlops_phishing.test")
 
 
-def test_filter_injects_request_id_from_context():
-    """Идентификатор запроса из контекста попадает в запись лога."""
-    token = REQUEST_ID.set("abcd1234")
-    record = make_record()
+def test_record_is_one_json_line_with_contract_fields(json_log):
+    log.info("Модель загружена: %s", "v3", extra={"model_version": "3"})
+
+    [record] = json_log.find("Модель загружена")
+    assert list(record)[:6] == ["timestamp", "level", "service", "env", "logger", "message"]
+    assert TIMESTAMP.match(str(record["timestamp"]))
+    assert record["level"] == "info"
+    assert record["logger"] == "mlops_phishing.test"
+    assert record["message"] == "Модель загружена: v3"
+    assert (record["service"], record["env"]) == ("test-service", "test")
+    assert record["model_version"] == "3"
+
+
+def test_context_fields_come_from_contextvars(json_log):
+    """task_id не передаётся в вызов лога — его кладёт контекст."""
+    with structlog.contextvars.bound_contextvars(task_id="t-1", request_id="r-1"):
+        log.warning("внутри задачи")
+    log.warning("снаружи")
+
+    [inside] = json_log.find("внутри задачи")
+    [outside] = json_log.find("снаружи")
+    assert (inside["task_id"], inside["request_id"], inside["level"]) == ("t-1", "r-1", "warning")
+    assert "task_id" not in outside
+
+
+def test_exception_is_a_string_with_traceback(json_log):
     try:
-        assert RequestIdFilter().filter(record) is True
-    finally:
-        REQUEST_ID.reset(token)
+        raise ValueError("boom")
+    except ValueError:
+        log.exception("ошибка обработки")
 
-    assert get_request_id(record) == "abcd1234"
-
-
-def test_filter_uses_placeholder_outside_request():
-    """Вне обработки запроса в логе стоит прочерк, а не пустота."""
-    record = make_record()
-
-    assert RequestIdFilter().filter(record) is True
-    assert get_request_id(record) == NO_REQUEST_ID
+    [record] = json_log.find("ошибка обработки")
+    assert record["level"] == "error"
+    assert "Traceback" in str(record["exception"])
+    assert "ValueError: boom" in str(record["exception"])
 
 
-def test_setup_logging_installs_single_handler_and_level():
-    """Настройка ставит один обработчик и заданный уровень."""
-    setup_logging("DEBUG")
+def test_passwords_in_urls_never_reach_the_log(json_log):
+    """Пароль из DSN или URL брокера скрыт и в сообщении, и в стектрейсе."""
+    url = "amqp://app:s3cret@rabbitmq:5672/"
+    try:
+        raise ConnectionError(f"cannot connect to {url}")
+    except ConnectionError:
+        log.exception("Брокер %s недоступен", url, extra={"dsn": "postgresql://u:pw1@db/x"})
+
+    assert "s3cret" not in json_log.text
+    assert "pw1" not in json_log.text
+    assert "amqp://app:***@rabbitmq:5672/" in json_log.text
+
+
+def test_mask_keeps_urls_without_credentials():
+    assert mask_credentials("http://mlflow:5000/api") == "http://mlflow:5000/api"
+    assert mask_credentials("postgresql://u:p@db:5432/x") == "postgresql://u:***@db:5432/x"
+
+
+def test_library_service_fields_are_dropped(json_log):
+    """uvicorn кладёт в extra копию сообщения с ANSI-цветами: в JSON ей не место."""
+    logging.getLogger("uvicorn.error").info("Started", extra={"color_message": "\x1b[1mStarted"})
+
+    [record] = json_log.find("Started")
+    assert "color_message" not in record
+
+
+def test_setup_logging_installs_single_json_handler_and_level(capsys):
+    setup_logging("DEBUG", "worker", "development")
     root = logging.getLogger()
 
     assert len(root.handlers) == 1
     assert root.level == logging.DEBUG
+    logging.getLogger("faststream").info("FastStream app started")
+    assert '"service": "worker"' in capsys.readouterr().out
 
 
-def test_setup_logging_takes_over_uvicorn_loggers():
-    """Логгеры uvicorn подчиняются общему формату, иначе в потоке два стиля."""
-    setup_logging("INFO")
-    root_handler = logging.getLogger().handlers[0]
+def test_service_name_follows_otel_service_name(monkeypatch, capsys):
+    """Поле service совпадает с service.name трейсов и метрик."""
+    monkeypatch.setenv("OTEL_SERVICE_NAME", "worker-2")
+    setup_logging("INFO", "worker", "development")
 
-    for name in ("uvicorn", "uvicorn.error"):
-        uvicorn_logger = logging.getLogger(name)
-        assert uvicorn_logger.handlers == [root_handler]
-        assert uvicorn_logger.propagate is False
+    log.info("hello")
+    assert '"service": "worker-2"' in capsys.readouterr().out
+
+
+def test_library_loggers_write_through_root(monkeypatch):
+    """У uvicorn и FastStream свои текстовые обработчики: их снимаем, пишут через корневой."""
+    faststream_logger = logging.getLogger("faststream")
+    monkeypatch.setattr(faststream_logger, "handlers", [logging.StreamHandler()])
+    monkeypatch.setattr(faststream_logger, "propagate", False)
+
+    setup_logging("INFO", "api", "development")
+
+    for name in ("uvicorn", "uvicorn.error", "faststream"):
+        assert logging.getLogger(name).handlers == []
+        assert logging.getLogger(name).propagate is True
+
+
+def test_uvicorn_config_created_later_keeps_json(monkeypatch):
+    """`faststream run` создаёт uvicorn.Config после импорта приложения — формат не ломается."""
+    setup_logging("INFO", "worker", "development")
+    monkeypatch.setattr(logging.getLogger("uvicorn.error"), "handlers", [logging.StreamHandler()])
+
+    uvicorn.Config(app=lambda: None, log_level="info")
+
+    assert logging.getLogger("uvicorn.error").handlers == []
+    assert logging.getLogger("uvicorn.error").propagate is True
+    # Access-лог uvicorn не пишется: его заменяет middleware API
+    assert logging.getLogger("uvicorn.access").propagate is False
+    assert logging.getLogger("uvicorn.access").handlers == []
 
 
 def test_setup_logging_disables_uvicorn_access_log(monkeypatch):
-    """Access-лог uvicorn выключен: middleware пишет то же самое, но с request_id.
-
-    Флаг сначала явно сбрасывается: lifespan в других тестах уже вызывал
-    setup_logging, и без сброса тест прошёл бы, даже если бы настройка
-    перестала выключать логгер.
-    """
     access_logger = logging.getLogger("uvicorn.access")
     monkeypatch.setattr(access_logger, "disabled", False)
 
-    setup_logging("INFO")
+    setup_logging("INFO", "api", "development")
 
     assert access_logger.disabled is True

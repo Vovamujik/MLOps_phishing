@@ -15,6 +15,7 @@ import urllib.error
 import urllib.request
 from urllib.parse import quote, unquote, urlsplit
 
+from mlops_phishing import logging_config
 from mlops_phishing.config import Settings, get_settings
 from mlops_phishing.messaging import (
     DEAD_LETTER_EXCHANGE,
@@ -113,8 +114,9 @@ def apply_topology(settings: Settings, attempts: int = 30) -> None:
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
-    apply_topology(get_settings())
+    settings = get_settings()
+    logging_config.setup_logging(settings.log_level, "rabbitmq-init", settings.environment)
+    apply_topology(settings)
 
 
 if __name__ == "__main__":
