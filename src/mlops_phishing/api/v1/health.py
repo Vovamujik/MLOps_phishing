@@ -26,7 +26,7 @@ async def read_health(request: Request, response: Response) -> HealthReport:
     """
     report = await health_service.build_report(
         request.app.state.db_pool,
-        request.app.state.model,
+        request.app.state.publisher,
         request.app.state.settings,
     )
     if report.status is not ReportStatus.ok:

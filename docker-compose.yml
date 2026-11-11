@@ -38,16 +38,122 @@ services:
       DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-mlops_phishing}
       ENVIRONMENT: ${ENVIRONMENT:-development}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      RABBITMQ_URL: amqp://${RABBITMQ_USER:-app}:${RABBITMQ_PASSWORD:-app}@rabbitmq:5672/
+      PUBLISH_TIMEOUT: ${PUBLISH_TIMEOUT:-2}
+      # Из них API считает Retry-After: должны совпадать с очередью и воркером
+      TASKS_QUEUE_MAX_LENGTH: ${TASKS_QUEUE_MAX_LENGTH:-100}
+      WORKER_POOL_SIZE: ${WORKER_POOL_SIZE:-4}
+      WORKER_PREFETCH: ${WORKER_PREFETCH:-4}
+      INFERENCE_DELAY_SECONDS: ${INFERENCE_DELAY_SECONDS:-0.2}
+    ports:
+      - "8000:8000"
+    # Модели в API нет — MLflow ему не нужен
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq-init:
+        condition: service_completed_successfully
+    logging: *default-logging
+
+  # Брокер задач. Management UI на http://localhost:15672
+  rabbitmq:
+    image: rabbitmq:4.3.6-management
+    # Имя узла rabbit@<hostname>: без фиксированного имени данные в томе не переживут пересоздание
+    hostname: rabbitmq
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-app}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-app}
+      # Docker Desktop 29: Erlang не может прочитать cookie, который сам создал (eacces),
+      # и брокер падает на старте. Cookie задаём явно серверу и CLI (healthcheck, rabbitmqctl)
+      RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS: -setcookie ${RABBITMQ_ERLANG_COOKIE:-mlops-phishing}
+      RABBITMQ_CTL_ERL_ARGS: -setcookie ${RABBITMQ_ERLANG_COOKIE:-mlops-phishing}
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_running"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    logging: *default-logging
+
+  # Одноразово задаёт топологию: очередь tasks, policy с лимитами, DLX и DLQ
+  rabbitmq-init:
+    build:
+      context: .
+    image: mlops-phishing:local
+    restart: "no"
+    command: ["python", "-m", "mlops_phishing.rabbit_setup"]
+    environment:
+      RABBITMQ_URL: amqp://${RABBITMQ_USER:-app}:${RABBITMQ_PASSWORD:-app}@rabbitmq:5672/
+      RABBITMQ_MANAGEMENT_URL: http://rabbitmq:15672
+      TASKS_QUEUE_MAX_LENGTH: ${TASKS_QUEUE_MAX_LENGTH:-100}
+      TASKS_DELIVERY_LIMIT: ${TASKS_DELIVERY_LIMIT:-3}
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    logging: *default-logging
+
+  # Воркер: задачи из очереди → модель → результат в базу. Порт наружу не публикуем,
+  # чтобы работал docker compose up -d --scale worker=2
+  worker:
+    image: mlops-phishing:local
+    restart: unless-stopped
+    command: ["faststream", "run", "mlops_phishing.worker:app", "--host", "0.0.0.0", "--port", "8001"]
+    environment:
+      RABBITMQ_URL: amqp://${RABBITMQ_USER:-app}:${RABBITMQ_PASSWORD:-app}@rabbitmq:5672/
+      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-mlops_phishing}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
       MLFLOW_TRACKING_URI: http://mlflow:5000
       MODEL_NAME: ${MODEL_NAME:-phishing-url-clf}
       MODEL_ALIAS: ${MODEL_ALIAS:-champion}
       MLFLOW_DISABLE_TELEMETRY: "true"
-    ports:
-      - "8000:8000"
+      WORKER_POOL_SIZE: ${WORKER_POOL_SIZE:-4}
+      WORKER_PREFETCH: ${WORKER_PREFETCH:-4}
+      INFERENCE_DELAY_SECONDS: ${INFERENCE_DELAY_SECONDS:-0.2}
+      WORKER_GRACEFUL_TIMEOUT: ${WORKER_GRACEFUL_TIMEOUT:-30}
+    # Больше graceful timeout воркера: Docker не добьёт SIGKILL, пока задачи дописываются
+    stop_grace_period: 40s
+    # Healthcheck образа смотрит на /healthz приложения, у воркера свой /health
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
     depends_on:
       postgres:
         condition: service_healthy
       mlflow:
+        condition: service_healthy
+      rabbitmq-init:
+        condition: service_completed_successfully
+    logging: *default-logging
+
+  # Источник: пакетный скоринг CSV. В docker compose up не входит, запускается вручную:
+  # docker compose run --rm source --limit 2000
+  source:
+    image: mlops-phishing:local
+    profiles: ["source"]
+    entrypoint: ["python", "-m", "mlops_phishing.source"]
+    environment:
+      RABBITMQ_URL: amqp://${RABBITMQ_USER:-app}:${RABBITMQ_PASSWORD:-app}@rabbitmq:5672/
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      SOURCE_BACKOFF_INITIAL: ${SOURCE_BACKOFF_INITIAL:-0.05}
+      SOURCE_BACKOFF_MAX: ${SOURCE_BACKOFF_MAX:-1.0}
+    # CSV в образ не входит (.dockerignore), берём с хоста
+    volumes:
+      - ./data:/app/data:ro
+    # Healthcheck образа ждёт HTTP на :8000, у источника его нет
+    healthcheck:
+      disable: true
+    # Не rabbitmq-init: он перезапустился бы и вернул лимит очереди к значению из env
+    depends_on:
+      rabbitmq:
         condition: service_healthy
     logging: *default-logging
 
@@ -148,5 +254,6 @@ services:
 
 volumes:
   postgres_data:
+  rabbitmq_data:
   mlflow_db_data:
   s3_data:

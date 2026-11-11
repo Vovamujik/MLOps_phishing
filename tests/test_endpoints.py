@@ -1,8 +1,8 @@
-"""Тесты HTTP-контракта всех трёх эндпоинтов."""
+"""Тесты HTTP-контракта системных эндпоинтов: liveness, версия, health."""
 
 from mlops_phishing.metadata import UNKNOWN
 
-from .conftest import FakePool, make_model, read_pyproject_version
+from .conftest import FakePool, FakePublisher, read_pyproject_version
 
 # --- GET /healthz --------------------------------------------------------
 
@@ -96,16 +96,16 @@ async def test_health_returns_503_when_dependency_is_down(client):
     assert body["status"] == "degraded"
     assert body["components"]["postgres"]["status"] == "unavailable"
     assert body["components"]["postgres"]["error"]
-    # MLflow в тестах тоже недоступен, поэтому модель не загрузилась
-    assert body["components"]["model"]["status"] == "unavailable"
+    # RabbitMQ в тестах тоже недоступен: соединение на закрытом порту
+    assert body["components"]["rabbitmq"]["status"] == "unavailable"
 
 
 async def test_health_returns_versions_and_latency_of_components(
-    client, install_pool, install_model
+    client, install_pool, install_publisher
 ):
     """Основное требование: версия каждого third-party и время его ответа."""
     install_pool(FakePool())
-    install_model(make_model(version="3"))
+    install_publisher(FakePublisher(version="4.3.6"))
 
     response = await client.get("/api/v1/health")
     body = response.json()
@@ -122,9 +122,9 @@ async def test_health_returns_versions_and_latency_of_components(
     assert postgres["latency_ms"] >= 0
     assert postgres["error"] is None
 
-    model = body["components"]["model"]
-    assert model["status"] == "healthy"
-    assert model["version"] == "phishing-url-clf v3 (@champion)"
+    rabbitmq = body["components"]["rabbitmq"]
+    assert rabbitmq["status"] == "healthy"
+    assert rabbitmq["version"] == "4.3.6"
 
 
 async def test_health_reports_latency_even_for_failed_component(client):

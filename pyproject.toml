@@ -17,6 +17,7 @@ dependencies = [
     "scikit-learn>=1.7",
     "pandas>=2.2",
     "skops>=0.13",
+    "faststream[cli,rabbit]>=0.7.7,<0.8",
 ]
 
 [dependency-groups]
@@ -28,6 +29,9 @@ dev = [
     "pytest-cov>=6.0.0",
     "httpx>=0.28.0",
     "asgi-lifespan>=2.1.0",
+    "testcontainers[rabbitmq]>=4.15",
+    "docker>=7.1",
+    "pika>=1.3",
 ]
 # Обучение и EDA на ноутбуке, в образ не попадает
 ml = [
@@ -45,6 +49,7 @@ testpaths = ["tests"]
 # auto: async-тесты не нужно помечать @pytest.mark.asyncio вручную
 asyncio_mode = "auto"
 addopts = "-q --cov --cov-report=term-missing"
+markers = ["integration: тесты на настоящих сервисах в Docker (Testcontainers)"]
 
 [tool.coverage.run]
 source = ["src/mlops_phishing"]
@@ -94,7 +99,7 @@ ignore = [
 "tests/**" = ["ANN", "S101"]
 
 [tool.ruff.lint.isort]
-known-first-party = ["mlops_phishing", "training"]
+known-first-party = ["mlops_phishing", "training", "experiments"]
 
 [tool.ruff.format]
 quote-style = "double"

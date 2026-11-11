@@ -10,11 +10,16 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import pytest
+from aio_pika.exceptions import DeliveryError, PublishError
+from aiormq.abc import DeliveredMessage
 from asgi_lifespan import LifespanManager
 from httpx import ASGITransport, AsyncClient
+from pamqp.commands import Basic
+from pamqp.header import ContentHeader
 
 from mlops_phishing.app import app
 from mlops_phishing.config import Settings, get_settings
+from mlops_phishing.messaging import TaskMessage
 from mlops_phishing.metadata import get_version
 from mlops_phishing.ml import LoadedModel
 
@@ -33,7 +38,7 @@ def read_pyproject_version() -> str:
 
 # Заведомо закрытый порт попытка подключения падает сразу
 DEAD_DATABASE_URL = "postgresql://postgres:postgres@127.0.0.1:59999/mlops_phishing"
-DEAD_MLFLOW_URI = "http://127.0.0.1:59998"
+DEAD_RABBITMQ_URL = "amqp://guest:guest@127.0.0.1:59997/"
 
 POSTGRES_VERSION_RAW = "PostgreSQL 16.15 (Debian 16.15-1) on aarch64-unknown-linux-gnu, gcc"
 
@@ -65,6 +70,44 @@ class FakePool:
 
     async def close(self) -> None:
         """Повторить контракт настоящего пула: его закрывает shutdown-фаза lifespan."""
+        self.closed = True
+
+
+def broker_nack() -> DeliveryError:
+    """Ответ брокера на публикацию в полную очередь (overflow=reject-publish)."""
+    return DeliveryError(None, Basic.Nack(delivery_tag=1))
+
+
+def broker_return() -> PublishError:
+    """Ответ брокера, когда очереди нет: сообщение вернулось отправителю."""
+    returned = Basic.Return(reply_code=312, reply_text="NO_ROUTE", exchange="", routing_key="tasks")
+    message = DeliveredMessage(delivery=returned, header=ContentHeader(), body=b"", channel=None)
+    return PublishError(message, returned)
+
+
+class FakePublisher:
+    """Заглушка издателя задач: запоминает задачи, отвечает версией брокера или ошибкой."""
+
+    def __init__(self, *, error: BaseException | None = None, version: str = "4.3.6") -> None:
+        self.error = error
+        self.version = version
+        self.tasks: list[TaskMessage] = []
+        self.closed = False
+
+    async def publish(self, task: TaskMessage) -> None:
+        """Запомнить попытку и изобразить ответ брокера."""
+        self.tasks.append(task)
+        if self.error is not None:
+            raise self.error
+
+    async def server_version(self) -> str:
+        """Версия брокера или отказ соединения."""
+        if self.error is not None:
+            raise self.error
+        return self.version
+
+    async def close(self) -> None:
+        """Повторить контракт настоящего издателя: его закрывает shutdown-фаза lifespan."""
         self.closed = True
 
 
@@ -133,8 +176,7 @@ async def client(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[AsyncClient]:
     `ASGITransport` вызывает приложение напрямую, без сокета и порта.
     """
     monkeypatch.setenv("DATABASE_URL", DEAD_DATABASE_URL)
-    monkeypatch.setenv("MLFLOW_TRACKING_URI", DEAD_MLFLOW_URI)
-    monkeypatch.setenv("MLFLOW_HTTP_REQUEST_MAX_RETRIES", "0")
+    monkeypatch.setenv("RABBITMQ_URL", DEAD_RABBITMQ_URL)
     get_settings.cache_clear()
 
     async with LifespanManager(app):
@@ -155,11 +197,11 @@ def install_pool(monkeypatch: pytest.MonkeyPatch) -> Callable[[FakePool], FakePo
 
 
 @pytest.fixture
-def install_model(monkeypatch: pytest.MonkeyPatch) -> Callable[[LoadedModel], LoadedModel]:
-    """Подменить загруженную модель в состоянии приложения."""
+def install_publisher(monkeypatch: pytest.MonkeyPatch) -> Callable[[FakePublisher], FakePublisher]:
+    """Подменить издателя задач в состоянии приложения на заглушку."""
 
-    def _install(model: LoadedModel) -> LoadedModel:
-        monkeypatch.setattr(app.state, "model", model, raising=False)
-        return model
+    def _install(publisher: FakePublisher) -> FakePublisher:
+        monkeypatch.setattr(app.state, "publisher", publisher, raising=False)
+        return publisher
 
     return _install

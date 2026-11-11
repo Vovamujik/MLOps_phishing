@@ -17,7 +17,7 @@ from time import perf_counter
 from mlops_phishing.config import Settings
 from mlops_phishing.db import DEPENDENCY_ERRORS, DatabasePool
 from mlops_phishing.metadata import get_version
-from mlops_phishing.ml import LoadedModel, ModelUnavailableError
+from mlops_phishing.publisher import BROKER_ERRORS, TaskPublisher
 from mlops_phishing.schemas import ComponentHealth, ComponentStatus, HealthReport, ReportStatus
 
 log = logging.getLogger(__name__)
@@ -25,7 +25,7 @@ log = logging.getLogger(__name__)
 POSTGRES_VERSION_QUERY = "SELECT version()"
 
 # Отказы, которые превращаются в статус unavailable, а не в 500
-CHECK_ERRORS = (*DEPENDENCY_ERRORS, ModelUnavailableError)
+CHECK_ERRORS = (*DEPENDENCY_ERRORS, *BROKER_ERRORS)
 
 
 def elapsed_ms(started_at: float) -> float:
@@ -45,11 +45,9 @@ async def read_postgres_version(pool: DatabasePool) -> str:
     return parse_postgres_version(str(raw))
 
 
-async def read_model_version(model: LoadedModel | None) -> str:
-    """Версия модели, загруженной при старте. Модель уже в памяти, в сеть не ходим."""
-    if model is None:
-        raise ModelUnavailableError("модель не загружена при старте, причина в логе")
-    return f"{model.name} v{model.version} (@{model.alias})"
+async def read_rabbitmq_version(publisher: TaskPublisher) -> str:
+    """Версия RabbitMQ — через то же соединение, которым API публикует задачи."""
+    return await publisher.server_version()
 
 
 async def run_check(probe: Awaitable[str], limit_seconds: float) -> ComponentHealth:
@@ -79,7 +77,7 @@ async def run_check(probe: Awaitable[str], limit_seconds: float) -> ComponentHea
 
 
 async def build_report(
-    pool: DatabasePool, model: LoadedModel | None, settings: Settings
+    pool: DatabasePool, publisher: TaskPublisher, settings: Settings
 ) -> HealthReport:
     """Собрать отчёт по всем third-party компонентам.
 
@@ -90,7 +88,7 @@ async def build_report(
     """
     checks: dict[str, Awaitable[str]] = {
         "postgres": read_postgres_version(pool),
-        "model": read_model_version(model),
+        "rabbitmq": read_rabbitmq_version(publisher),
     }
 
     started_at = perf_counter()

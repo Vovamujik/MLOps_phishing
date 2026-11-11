@@ -48,6 +48,8 @@ async def create_pool(settings: Settings) -> asyncpg.Pool:
         settings.database_url,
         min_size=0,
         max_size=5,
+        # Подключение и запрос — не дольше таймаута: зависшая база не держит запрос API минуту
+        timeout=settings.health_check_timeout,
         command_timeout=settings.health_check_timeout,
     )
     log.info("Пул соединений с Postgres создан: %s", mask_dsn(settings.database_url))
