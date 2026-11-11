@@ -128,3 +128,120 @@ groups:
           description: >-
             Задачи исчерпали попытки доставки. Найдите их в логах:
             {service="worker", level="error"} и событие перевода в DLQ, затем трейс по trace_id.
+
+      - uid: task-slo-fast-burn
+        title: SLO «99% задач быстрее 10 с» — быстрое сжигание бюджета
+        condition: C
+        data:
+          # Burn rate = (1 − доля задач быстрее 10 с) / 1%: во сколько раз быстрее нормы
+          # тратится бюджет ошибок. Два окна, как в multiwindow-правиле Google SRE: длинное
+          # подтверждает, что это не всплеск, короткое — что проблема ещё идёт (алерт гаснет
+          # сразу после починки, а не через час). В проде окна 1 ч и 5 мин; стенд живёт
+          # минуты, поэтому окна уменьшены в 12 раз: 5 мин и 1 мин.
+          # «>= 0» отбрасывает NaN: без задач доля 0/0 = NaN, а математика Grafana считает
+          # NaN > 14.4 истиной — алерт висел в Pending на пустом стенде
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: prometheus
+            model:
+              refId: A
+              expr: >-
+                (1 - sum(rate(worker_task_duration_seconds_bucket{job="worker", le="10"}[5m]))
+                / sum(rate(worker_task_duration_seconds_count{job="worker"}[5m]))) / 0.01 >= 0
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+          - refId: B
+            relativeTimeRange:
+              from: 60
+              to: 0
+            datasourceUid: prometheus
+            model:
+              refId: B
+              expr: >-
+                (1 - sum(rate(worker_task_duration_seconds_bucket{job="worker", le="10"}[1m]))
+                / sum(rate(worker_task_duration_seconds_count{job="worker"}[1m]))) / 0.01 >= 0
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+          - refId: C
+            datasourceUid: __expr__
+            relativeTimeRange:
+              from: 0
+              to: 0
+            model:
+              refId: C
+              type: math
+              # 14.4: при таком темпе за 1 ч уходит 2% 30-дневного бюджета, весь — за 2 дня.
+              # Это порог «будить человека» из SRE workbook; медленное сжигание (6 ч / 30 мин,
+              # порог 6) — тикет, на стенде его не ждём
+              expression: $A > 14.4 && $B > 14.4
+        # Окна уже сглаживают; 1 мин отсекает разовый хвост медленных задач после старта
+        # воркера (модель грузится, очередь копится)
+        for: 1m
+        # Задач нет — нечего нарушать: сжигать бюджет нечем
+        noDataState: OK
+        execErrState: Error
+        labels:
+          severity: critical
+          slo: task-latency
+        annotations:
+          __dashboardUid__: pipeline
+          __panelId__: "27"
+          summary: >-
+            Бюджет ошибок SLO сгорает в {{ humanize $values.A.Value }} раз быстрее нормы
+            (5 мин), {{ humanize $values.B.Value }} (1 мин)
+          description: >-
+            Больше 14.4% задач идут дольше 10 с от постановки до записи. Обычно воркеры не
+            успевают: очередь у лимита, задача ждёт в ней дольше SLO. Добавьте воркер
+            (docker compose up -d --scale worker=2) или проверьте inference на дашборде.
+
+      - uid: rabbitmq-scrape-down
+        title: Prometheus не видит метрики RabbitMQ
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 60
+              to: 0
+            datasourceUid: prometheus
+            model:
+              refId: A
+              # up — служебный ряд скрейпа: 1 цель ответила, 0 нет. Он есть и когда RabbitMQ
+              # лежит, поэтому это не NoData, а явный 0. Без этого правила алерты на очередь и
+              # DLQ при потере скрейпа молча уходят в NoData → OK
+              expr: max(up{job="rabbitmq"})
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+          - refId: C
+            datasourceUid: __expr__
+            relativeTimeRange:
+              from: 0
+              to: 0
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: lt
+                    params: [1]
+        # Минута — 12 скрейпов: перезапуск брокера (контейнер поднимается ~10–20 с) не будит,
+        # а лежащий брокер — да
+        for: 1m
+        # Ряда up нет совсем — значит, нет скрейп-джоба или самого Prometheus: тоже тревога
+        noDataState: Alerting
+        execErrState: Error
+        labels:
+          severity: critical
+        annotations:
+          summary: Скрейп RabbitMQ не отвечает дольше минуты — глубина очередей и DLQ не видны
+          description: >-
+            Проверьте docker compose ps rabbitmq и Prometheus → Status → Targets. Пока скрейпа нет,
+            алерты на заполнение очереди и DLQ не сработают.

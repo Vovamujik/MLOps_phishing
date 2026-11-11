@@ -1421,6 +1421,249 @@
           "queryType": "range"
         }
       ]
+    },
+    {
+      "id": 24,
+      "type": "row",
+      "title": "SLO: 99% задач быстрее 10 с",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 66,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 25,
+      "type": "timeseries",
+      "title": "SLI: доля задач быстрее 10 с",
+      "description": "Задача целиком — от постановки в очередь до записи результата (worker_task_duration_seconds). SLO 99%: красная линия. Доля = rate бакета le=\"10\" / rate всех задач.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 67,
+        "w": 8,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "thresholdsStyle": {
+              "mode": "line+area"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "max": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "transparent",
+                "value": 0.99
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(rate(worker_task_duration_seconds_bucket{job=\"worker\", le=\"10\"}[$__rate_interval])) / sum(rate(worker_task_duration_seconds_count{job=\"worker\"}[$__rate_interval]))",
+          "legendFormat": "доля быстрее 10 с",
+          "refId": "A",
+          "range": true,
+          "instant": false
+        }
+      ]
+    },
+    {
+      "id": 26,
+      "type": "stat",
+      "title": "Остаток error budget за 1 ч",
+      "description": "Бюджет ошибок — 1% задач за окно. Остаток = 1 − (доля медленных за 1 ч) / 1%. Окно стенда — 1 ч (стенд живёт часы); в проде — 30 дней.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 8,
+        "y": 67,
+        "w": 6,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "decimals": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 0
+              },
+              {
+                "color": "green",
+                "value": 0.5
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "background",
+        "graphMode": "area",
+        "textMode": "value"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "A",
+          "instant": true,
+          "range": false,
+          "expr": "1 - (1 - sum(increase(worker_task_duration_seconds_bucket{job=\"worker\", le=\"10\"}[1h])) / sum(increase(worker_task_duration_seconds_count{job=\"worker\"}[1h]))) / 0.01"
+        }
+      ]
+    },
+    {
+      "id": 27,
+      "type": "timeseries",
+      "title": "Burn rate бюджета (1 м и 5 м)",
+      "description": "Во сколько раз быстрее нормы тратится бюджет: (1 − SLI) / 1%. 1 — ровно по плану, 14.4 — порог алерта (при таком темпе 30-дневный бюджет кончается за 2 дня). Окна 1 м и 5 м — уменьшенные в 12 раз 5 м и 1 ч из прод-правила.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 14,
+        "y": 67,
+        "w": 10,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "suffix:×",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "thresholdsStyle": {
+              "mode": "dashed"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 14.4
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "(1 - sum(rate(worker_task_duration_seconds_bucket{job=\"worker\", le=\"10\"}[1m])) / sum(rate(worker_task_duration_seconds_count{job=\"worker\"}[1m]))) / 0.01",
+          "legendFormat": "burn rate 1 м",
+          "refId": "A",
+          "range": true,
+          "instant": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "(1 - sum(rate(worker_task_duration_seconds_bucket{job=\"worker\", le=\"10\"}[5m])) / sum(rate(worker_task_duration_seconds_count{job=\"worker\"}[5m]))) / 0.01",
+          "legendFormat": "burn rate 5 м",
+          "refId": "B",
+          "range": true,
+          "instant": false
+        }
+      ]
     }
   ]
 }
