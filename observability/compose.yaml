@@ -6,7 +6,8 @@
 #   docker compose --profile observability up -d  # всё вместе + Grafana
 # Пути к конфигам ниже — относительно этой папки (так работает include).
 # Бюджет памяти профиля observability — сумма mem_limit: 160 (alloy) + 256 (loki) + 160 (collector)
-# + 256 (tempo) + 256 (prometheus) + 384 (grafana) = 1472 MiB ≈ 1,44 ГиБ.
+# + 256 (tempo) + 256 (prometheus) + 384 (grafana) = 1472 MiB ≈ 1,44 ГиБ. Плюс 16 MiB у
+# одноразового hc-tools: он копирует busybox и сразу завершается, память не держит.
 
 x-logging: &default-logging
   driver: json-file
@@ -26,6 +27,8 @@ services:
     command: ["cp", "/bin/busybox", "/hc/busybox"]
     volumes:
       - obs_hc_tools:/hc
+    # Живёт доли секунды, но правило стенда — лимит у каждого сервиса наблюдаемости
+    mem_limit: 16m
     logging: *default-logging
 
   # Хранилище логов. Индексирует только лейблы (service, level, env), текст — сжатыми чанками

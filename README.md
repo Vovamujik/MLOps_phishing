@@ -276,6 +276,7 @@ uv run pre-commit run --all-files
 |---|---|
 | `lint` | `uv lock --check`, `ruff check`, `ruff format --check`, все хуки pre-commit |
 | `test` | pytest с покрытием (падает ниже 80%) |
+| `observability` | конфиги наблюдаемости проверяют сами инструменты тех же версий, что на стенде: `docker compose --profile … config` для всех профилей, `promtool check config`, `alloy validate`, `otelcol validate`, `loki -verify-config`, `tempo -config.verify`. Правила лабы, которых инструменты не знают (единицы на панелях, `rate` у счётчиков, `for` у алертов, закреплённые образы, лимиты памяти, лейблы Loki), проверяет `tests/test_observability_config.py` в job `test` |
 | `smoke` | поднимает MLflow, регистрирует игрушечную seed-модель как `@champion`, `docker compose up --wait` (API, RabbitMQ, воркер), запросы к эндпоинтам и задача через `POST /api/v1/tasks`, которая доходит до `DONE` с версией модели 1 |
 
 ### CD — `.github/workflows/cd.yml`
@@ -579,6 +580,9 @@ sum(rate(worker_task_duration_seconds_bucket{job="worker", le="10"}[5m]))
 | prometheus | 256 MiB | 50 MiB |
 | grafana | 384 MiB | 269 MiB |
 | **итого** | **1472 MiB (1,44 ГиБ)** | **767 MiB** |
+
+Одноразовый `hc-tools` (лимит 16 MiB) копирует busybox в том и сразу завершается,
+в постоянный бюджет он не входит.
 
 Замер — прогон 4000 задач источником и поток `POST /api/v1/tasks` на полной
 очереди. Retention: Loki, Tempo и Prometheus — 2 суток. Образы закреплены по

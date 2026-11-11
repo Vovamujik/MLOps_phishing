@@ -45,6 +45,41 @@ jobs:
       - name: Pytest (порог покрытия из pyproject роняет job)
         run: uv run pytest
 
+  observability:
+    name: Observability configs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # Те же версии образов, что поднимает стенд: валидатор другой версии мог бы
+      # пропустить ключ, которого в нашей версии нет, или забраковать новый
+      - name: Версии образов из .env.example
+        run: grep -E '^[A-Z_]+_VERSION=' .env.example >> "$GITHUB_ENV"
+      - name: Профили compose собираются
+        run: |
+          for profile in logs traces metrics observability; do
+            docker compose --profile "$profile" config -q
+          done
+      - name: Prometheus (promtool)
+        run: >-
+          docker run --rm -v "$PWD/observability/prometheus:/cfg:ro" --entrypoint promtool
+          "prom/prometheus:$PROMETHEUS_VERSION" check config /cfg/prometheus.yml
+      - name: Alloy
+        run: >-
+          docker run --rm -v "$PWD/observability/alloy:/cfg:ro"
+          "grafana/alloy:$ALLOY_VERSION" validate /cfg/config.alloy
+      - name: OpenTelemetry Collector
+        run: >-
+          docker run --rm -v "$PWD/observability/otel-collector.yaml:/cfg.yaml:ro"
+          "otel/opentelemetry-collector-contrib:$OTEL_COLLECTOR_VERSION" validate --config=/cfg.yaml
+      - name: Loki
+        run: >-
+          docker run --rm -v "$PWD/observability/loki:/cfg:ro"
+          "grafana/loki:$LOKI_VERSION" -config.file=/cfg/loki.yaml -verify-config
+      - name: Tempo
+        run: >-
+          docker run --rm -v "$PWD/observability/tempo:/cfg:ro"
+          "grafana/tempo:$TEMPO_VERSION" -config.file=/cfg/tempo.yaml -config.verify=true
+
   smoke:
     name: Docker compose smoke test
     runs-on: ubuntu-latest
