@@ -17,7 +17,13 @@ dependencies = [
     "scikit-learn>=1.7",
     "pandas>=2.2",
     "skops>=0.13",
-    "faststream[cli,rabbit]>=0.7.7,<0.8",
+    "faststream[cli,otel,rabbit]>=0.7.7,<0.8",
+    "structlog>=25.1",
+    "opentelemetry-sdk>=1.45",
+    "opentelemetry-exporter-otlp-proto-http>=1.45",
+    "opentelemetry-instrumentation-fastapi>=0.66b2",
+    "opentelemetry-instrumentation-asyncpg>=0.66b2",
+    "opentelemetry-instrumentation-system-metrics>=0.66b2",
 ]
 
 [dependency-groups]
@@ -32,6 +38,7 @@ dev = [
     "testcontainers[rabbitmq]>=4.15",
     "docker>=7.1",
     "pika>=1.3",
+    "pyyaml>=6.0",
 ]
 # Обучение и EDA на ноутбуке, в образ не попадает
 ml = [
@@ -99,7 +106,7 @@ ignore = [
 "tests/**" = ["ANN", "S101"]
 
 [tool.ruff.lint.isort]
-known-first-party = ["mlops_phishing", "training", "experiments"]
+known-first-party = ["mlops_phishing", "training", "experiments", "demo"]
 
 [tool.ruff.format]
 quote-style = "double"

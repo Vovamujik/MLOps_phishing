@@ -6,7 +6,6 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 from mlops_phishing.app import QUIET_PATHS, access_log_level, create_app
-from mlops_phishing.logging_config import NO_REQUEST_ID, RequestIdFilter, get_request_id
 
 ACCESS_LOGGER = "mlops_phishing.app"
 
@@ -24,6 +23,7 @@ ACCESS_LOGGER = "mlops_phishing.app"
         ("/healthz", 200, logging.DEBUG),
         ("/healthz", 404, logging.WARNING),
         ("/healthz", 503, logging.ERROR),
+        ("/api/v1/health", 200, logging.DEBUG),
     ],
 )
 def test_level_depends_on_status_and_path(path, status_code, expected):
@@ -37,96 +37,90 @@ def test_planned_load_shedding_is_a_warning_not_an_error():
     assert access_log_level("/api/v1/tasks", 503) == logging.ERROR
 
 
-def test_liveness_probe_is_quiet():
-    """Liveness дёргается оркестратором постоянно и не должен шуметь на INFO."""
-    assert "/healthz" in QUIET_PATHS
+def test_health_probes_are_quiet():
+    """Пробы дёргаются оркестратором и мониторингом постоянно и не должны шуметь на INFO."""
+    assert {"/healthz", "/api/v1/health"} <= QUIET_PATHS
 
 
-@pytest.fixture
-def access_log(caplog: pytest.LogCaptureFixture) -> pytest.LogCaptureFixture:
-    """Перехватывать записи access-лога, включая DEBUG.
-
-    Уровень логгера middleware временно опускается до DEBUG, иначе записи
-    о /healthz даже не создаются. caplog сам вернёт уровень после теста.
-    """
-    caplog.set_level(logging.DEBUG, logger=ACCESS_LOGGER)
-    return caplog
-
-
-def records_for(caplog: pytest.LogCaptureFixture, path: str) -> list[logging.LogRecord]:
-    """Записи access-лога о запросах к конкретному пути."""
+def access_records(json_log, method: str, path: str) -> list[dict[str, object]]:
+    """Строки access-лога о запросах к конкретному пути."""
     return [
         record
-        for record in caplog.records
-        if record.name == ACCESS_LOGGER and record.getMessage().startswith(f"GET {path} ")
+        for record in json_log.records
+        if record["logger"] == ACCESS_LOGGER
+        and record.get("path") == path
+        and record.get("method") == method
     ]
 
 
-async def test_request_is_logged_once_with_client_and_request_id(client, access_log):
+async def test_request_is_logged_once_with_client_and_request_id(client, json_log):
     """Одна строка на запрос, с IP клиента и тем же id, что в заголовке ответа."""
     response = await client.get("/api/v1/version")
 
-    records = records_for(access_log, "/api/v1/version")
-    assert len(records) == 1
-    [record] = records
-    assert record.levelno == logging.INFO
-    assert "client=127.0.0.1" in record.getMessage()
-    assert get_request_id(record) == response.headers["X-Request-ID"]
+    [record] = access_records(json_log, "GET", "/api/v1/version")
+    assert record["level"] == "info"
+    assert record["message"] == "GET /api/v1/version -> 200"
+    assert record["client"] == "127.0.0.1"
+    assert record["status_code"] == 200
+    assert isinstance(record["duration_ms"], float)
+    assert record["request_id"] == response.headers["X-Request-ID"]
 
 
-async def test_client_error_is_logged_as_warning(client, access_log):
+async def test_client_error_is_logged_as_warning(client, json_log):
     """Запрос к несуществующему адресу виден как предупреждение."""
     await client.get("/does-not-exist")
 
-    [record] = records_for(access_log, "/does-not-exist")
-    assert record.levelno == logging.WARNING
+    [record] = access_records(json_log, "GET", "/does-not-exist")
+    assert record["level"] == "warning"
 
 
-async def test_degraded_health_is_logged_as_error(client, access_log):
-    """503 от health при недоступной базе попадает в лог как ошибка."""
+async def test_degraded_health_is_logged_as_error(client, json_log):
+    """503 от health при недоступной базе попадает в лог как ошибка, хоть путь и тихий."""
     response = await client.get("/api/v1/health")
 
     assert response.status_code == 503
-    [record] = records_for(access_log, "/api/v1/health")
-    assert record.levelno == logging.ERROR
+    [record] = access_records(json_log, "GET", "/api/v1/health")
+    assert record["level"] == "error"
 
 
-async def test_successful_liveness_probe_is_logged_at_debug(client, access_log):
+async def test_successful_liveness_probe_is_logged_at_debug(client, json_log):
     """Успешный /healthz уходит на DEBUG и не засоряет INFO."""
     await client.get("/healthz")
 
-    [record] = records_for(access_log, "/healthz")
-    assert record.levelno == logging.DEBUG
+    [record] = access_records(json_log, "GET", "/healthz")
+    assert record["level"] == "debug"
 
 
-async def test_unhandled_exception_is_logged_as_error_with_request_id(caplog):
-    """Запрос, упавший с исключением, всё равно оставляет строку в логе.
+async def test_request_id_does_not_leak_out_of_request(client, json_log):
+    await client.get("/api/v1/version")
+    logging.getLogger("mlops_phishing.test").info("после запроса")
+
+    [record] = json_log.find("после запроса")
+    assert "request_id" not in record
+
+
+async def test_unhandled_exception_is_logged_as_error_with_request_id(request):
+    """Запрос, упавший с исключением, всё равно оставляет строку в логе со стектрейсом.
 
     uvicorn.access выключен, так что эта строка — единственная запись о методе,
     пути и клиенте такого запроса. Используется отдельный экземпляр приложения,
-    чтобы не добавлять падающий маршрут в общее. Фильтр request_id вешается
-    на обработчик caplog: lifespan здесь не запускается, и обработчика
-    приложения на корневом логгере нет.
+    чтобы не добавлять падающий маршрут в общее. Перехват логов — после create_app:
+    он заново настраивает корневой логгер.
     """
     crashing_app = create_app()
+    json_log = request.getfixturevalue("json_log")
 
     @crashing_app.get("/boom")
     async def boom() -> None:
         raise RuntimeError("kaboom")
 
-    caplog.set_level(logging.DEBUG, logger=ACCESS_LOGGER)
-    request_id_filter = RequestIdFilter()
-    caplog.handler.addFilter(request_id_filter)
-    try:
-        transport = ASGITransport(app=crashing_app, raise_app_exceptions=False)
-        async with AsyncClient(transport=transport, base_url="http://test") as http_client:
-            response = await http_client.get("/boom")
-    finally:
-        caplog.handler.removeFilter(request_id_filter)
+    transport = ASGITransport(app=crashing_app, raise_app_exceptions=False)
+    async with AsyncClient(transport=transport, base_url="http://test") as http_client:
+        response = await http_client.get("/boom")
 
     assert response.status_code == 500
-    [record] = records_for(caplog, "/boom")
-    assert record.levelno == logging.ERROR
-    assert "-> 500" in record.getMessage()
-    assert "exception=RuntimeError" in record.getMessage()
-    assert get_request_id(record) != NO_REQUEST_ID
+    [record] = access_records(json_log, "GET", "/boom")
+    assert record["level"] == "error"
+    assert record["message"] == "GET /boom -> 500"
+    assert "RuntimeError: kaboom" in str(record["exception"])
+    assert record["request_id"]

@@ -23,8 +23,11 @@ import math
 import uuid
 from datetime import UTC, datetime
 
+import structlog
 from aio_pika.exceptions import DeliveryError, PublishError
 from fastapi import APIRouter, HTTPException, Request, Response, status
+from opentelemetry import trace
+from opentelemetry.trace import StatusCode
 
 from mlops_phishing import tasks_repo
 from mlops_phishing.config import Settings
@@ -62,6 +65,12 @@ def retry_after_seconds(settings: Settings) -> int:
     return max(1, math.ceil(round(seconds, 3)))
 
 
+def mark_failed(span: trace.Span, exc: BaseException, reason: str) -> None:
+    """503 в трейсе: статус ERROR и само исключение брокера на спане запроса."""
+    span.record_exception(exc)
+    span.set_status(StatusCode.ERROR, reason)
+
+
 @router.post(
     "/tasks",
     status_code=status.HTTP_202_ACCEPTED,
@@ -79,18 +88,29 @@ async def create_task(payload: TaskCreate, request: Request, response: Response)
     task = TaskMessage(
         task_id=uuid.uuid4(), url=payload.url, source="api", enqueued_at=datetime.now(UTC)
     )
+    # Все записи запроса дальше — с task_id; access-лог middleware берёт его из state
+    structlog.contextvars.bind_contextvars(task_id=str(task.task_id))
+    request.state.task_id = task.task_id
+    # По task.id трейс ищется в Tempo: {span.task.id = "..."}
+    span = trace.get_current_span()
+    span.set_attribute("task.id", str(task.task_id))
 
     try:
         await publisher.publish(task)
     except PublishError as exc:
-        log.error("Очереди задач нет: %s", exc)
+        mark_failed(span, exc, "очереди задач нет")
+        log.error("Очереди задач нет: 503", exc_info=exc)
         raise HTTPException(
             status.HTTP_503_SERVICE_UNAVAILABLE, "Очередь задач не настроена"
         ) from exc
     except DeliveryError as exc:
-        # Брокер ответил nack: очередь полна. Ждать места нельзя — отказ сразу
+        # Брокер ответил nack: очередь полна. Ждать места нельзя — отказ сразу.
+        # WARNING, а не ERROR: это штатный сброс нагрузки, но его должно быть видно
         seconds = retry_after_seconds(settings)
-        log.info("Очередь заполнена: 503, Retry-After %d с", seconds)
+        mark_failed(span, exc, "очередь заполнена")
+        log.warning(
+            "Очередь заполнена: 503, Retry-After %d с", seconds, extra={"retry_after": seconds}
+        )
         raise HTTPException(
             status.HTTP_503_SERVICE_UNAVAILABLE,
             f"Очередь задач заполнена, повторите через {seconds} с",
@@ -98,7 +118,8 @@ async def create_task(payload: TaskCreate, request: Request, response: Response)
         ) from exc
     except BROKER_ERRORS as exc:
         # После таймаута исход неизвестен: задача могла уйти (см. docstring модуля)
-        log.error("Брокер недоступен: %s: %s", type(exc).__name__, exc)
+        mark_failed(span, exc, "брокер недоступен")
+        log.error("Брокер недоступен: 503", exc_info=exc)
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Брокер задач недоступен") from exc
 
     try:
@@ -106,9 +127,7 @@ async def create_task(payload: TaskCreate, request: Request, response: Response)
             request.app.state.db_pool, task.task_id, task.url, task.enqueued_at
         )
     except DEPENDENCY_ERRORS as exc:
-        log.warning(
-            "Задача %s в очереди, строка PENDING не записана: %s", task.task_id, type(exc).__name__
-        )
+        log.warning("Задача в очереди, строка PENDING не записана: %s", type(exc).__name__)
 
     status_url = str(request.url_for("read_task", task_id=str(task.task_id)))
     response.headers["Location"] = status_url

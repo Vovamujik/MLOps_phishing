@@ -13,34 +13,66 @@ prefetch равен числу потоков пула: каждой взято�
 - битое сообщение или ошибка в коде: reject без возврата, сразу в DLQ —
   повтор дал бы ту же ошибку.
 
+Контекст задачи: middleware на время сообщения кладёт в contextvars task_id (из
+correlation_id) и номер попытки (из x-delivery-count quorum-очереди), поэтому они есть
+во всех записях обработчика без передачи руками. Он же логирует перевод в DLQ.
+
+Трейс: RabbitTelemetryMiddleware продолжает трейс издателя по traceparent из заголовков
+(спан process), внутри — ручные спаны inference и db.save_result. run_in_executor не
+копирует contextvars, поэтому inference запускается в копии контекста: иначе спан
+оказался бы корневым, а записи из потока — без task_id и trace_id.
+
 Запуск: faststream run mlops_phishing.worker:app --host 0.0.0.0 --port 8001
 """
 
 import asyncio
+import contextvars
 import json
 import logging
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass, field
+from datetime import UTC, datetime
+from types import TracebackType
+from typing import Any
 
+import aio_pika
 import asyncpg
-from faststream import AckPolicy
+import structlog
+from faststream import AckPolicy, BaseMiddleware, ContextRepo
 from faststream.asgi import AsgiFastStream, AsgiResponse, get, make_ping_asgi
 from faststream.exceptions import RejectMessage
+from faststream.message import StreamMessage
 from faststream.rabbit import RabbitBroker
 from faststream.rabbit.schemas import Channel
+from opentelemetry import trace
 
-from mlops_phishing import logging_config, ml, tasks_repo
+from mlops_phishing import instruments, logging_config, ml, tasks_repo, telemetry
 from mlops_phishing.config import Settings, get_settings
-from mlops_phishing.messaging import TASKS_QUEUE, TaskMessage
+from mlops_phishing.instruments import Outcome
+from mlops_phishing.messaging import (
+    BROKER_LOGGER,
+    TASKS_QUEUE,
+    TaskMessage,
+    telemetry_middleware,
+)
 from mlops_phishing.tasks_repo import TaskResult
 
 log = logging.getLogger(__name__)
 
 # Временные отказы базы или сети: задачу стоит повторить
 RETRYABLE_ERRORS = (asyncpg.PostgresError, OSError, TimeoutError)
+
+# Заголовок quorum-очереди: сколько раз задачу уже вернули (reject с возвратом)
+DELIVERY_COUNT_HEADER = "x-delivery-count"
+
+# Атрибут спана process: число возвратов задачи по данным брокера
+DELIVERY_COUNT_ATTRIBUTE = "messaging.rabbitmq.delivery_count"
+
+RawMessage = aio_pika.IncomingMessage
+ConsumeNext = Callable[[StreamMessage[RawMessage]], Awaitable[object]]
 
 
 @dataclass
@@ -51,6 +83,7 @@ class WorkerStats:
     processed: int = 0
     duplicates: int = 0
     retried: int = 0
+    dead_lettered: int = 0
 
 
 @dataclass
@@ -69,16 +102,144 @@ class Worker:
     state: WorkerState
 
 
+def delivery_count(headers: dict[str, Any] | None) -> int:
+    """Сколько раз задачу уже возвращали в очередь: 0 у первой доставки."""
+    value = (headers or {}).get(DELIVERY_COUNT_HEADER, 0)
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def mark_dead_lettered(reason: str) -> None:
+    """Перевод в DLQ на спане process: событие видно на таймлайне трейса."""
+    span = trace.get_current_span()
+    span.set_attribute("messaging.rabbitmq.dead_lettered", True)
+    span.add_event("dead_lettered", {"reason": reason, "queue": "tasks.dlq"})
+
+
+class TaskContextMiddleware(BaseMiddleware):
+    """task_id и номер попытки — в contextvars на время сообщения; итог — в лог.
+
+    Брокер создаёт экземпляр на каждое сообщение. task_id берётся из correlation_id
+    (издатели ставят его равным task_id), у сообщений без него — из message_id.
+    """
+
+    def __init__(
+        self, msg: RawMessage | None, /, *, context: ContextRepo, state: WorkerState
+    ) -> None:
+        super().__init__(msg, context=context)
+        self.state = state
+        self.redeliveries = delivery_count(getattr(msg, "headers", None))
+        self.attempt = self.redeliveries + 1
+        # redelivered — ещё и возврат без reject: воркер упал или закрыл канал с задачей
+        self.redelivered = self.redeliveries > 0 or bool(getattr(msg, "redelivered", False))
+        task_id = getattr(msg, "correlation_id", None) or getattr(msg, "message_id", None)
+        self.task_id = str(task_id) if task_id else None
+        self._tokens: dict[str, Any] = {}
+
+    async def on_receive(self) -> None:
+        fields: dict[str, object] = {"attempt": self.attempt}
+        if self.task_id:
+            fields["task_id"] = self.task_id
+        self._tokens = structlog.contextvars.bind_contextvars(**fields)
+
+    async def consume_scope(  # type: ignore[override]
+        self, call_next: ConsumeNext, msg: StreamMessage[RawMessage]
+    ) -> object:
+        """Перевод в DLQ — ERROR: задача больше не повторится, нужен человек.
+
+        Текущий спан здесь — process из RabbitTelemetryMiddleware: на него вешаем номер
+        попытки и task_id (по нему трейс ищется в Tempo), а при переводе в DLQ — событие.
+        """
+        span = trace.get_current_span()
+        span.set_attribute(DELIVERY_COUNT_ATTRIBUTE, self.redeliveries)
+        span.set_attribute("messaging.delivery.attempt", self.attempt)
+        if self.task_id:
+            span.set_attribute("task.id", self.task_id)
+        # Здесь, а не в on_receive: on_receive вызывается до спана process, и записи
+        # остались бы без trace_id — а повторная доставка как раз то, что ищут по трейсу
+        log.debug("Задача получена")
+        if self.redelivered:
+            instruments.worker_redeliveries.add(1)
+            log.info("Повторная доставка задачи")
+        try:
+            result = await call_next(msg)
+        except RejectMessage as exc:
+            if not exc.extra_options.get("requeue"):
+                self.dead_letter("отклонена без повтора")
+            elif self.redeliveries >= self.state.settings.tasks_delivery_limit:
+                # Это возврат сверх delivery-limit: брокер переложит задачу в DLQ
+                self.dead_letter("исчерпаны попытки")
+            else:
+                instruments.worker_processed.add(1, {"result": Outcome.ERROR})
+            raise
+        except Exception:
+            # Битое сообщение или ошибка в коде: reject без возврата, сразу в DLQ.
+            # Исключение и статус ERROR спану process ставит RabbitTelemetryMiddleware
+            self.state.stats.dead_lettered += 1
+            instruments.worker_processed.add(1, {"result": Outcome.DLQ})
+            mark_dead_lettered("ошибка обработки")
+            log.exception("Ошибка обработки, задача переведена в DLQ без повторов")
+            raise
+        instruments.worker_processed.add(1, {"result": Outcome.OK})
+        return result
+
+    def dead_letter(self, reason: str) -> None:
+        self.state.stats.dead_lettered += 1
+        instruments.worker_processed.add(1, {"result": Outcome.DLQ})
+        mark_dead_lettered(reason)
+        log.error(
+            "Задача переведена в DLQ: %s",
+            reason,
+            extra={"delivery_limit": self.state.settings.tasks_delivery_limit},
+        )
+
+    async def after_processed(
+        self,
+        exc_type: type[BaseException] | None = None,
+        exc_val: BaseException | None = None,
+        exc_tb: TracebackType | None = None,
+    ) -> bool | None:
+        structlog.contextvars.reset_contextvars(**self._tokens)
+        return False
+
+
 def score(model: ml.LoadedModel, url: str, delay: float) -> float:
     """Inference в потоке пула. Задержка имитирует тяжёлую модель, задаётся конфигом.
 
     Вызывается только через run_in_executor: sleep здесь держит поток пула, а
-    не event loop, поэтому воркер в это время отвечает на /health.
+    не event loop, поэтому воркер в это время отвечает на /health. Спан inference —
+    дочерний к process, если поток запущен в копии контекста (см. process).
     """
-    probability = model.phishing_probability(url)
-    if delay > 0:
-        time.sleep(delay)
+    attributes = {
+        "model.name": model.name,
+        "model.alias": model.alias,
+        "model.version": model.version,
+    }
+    started = time.perf_counter()
+    with telemetry.tracer().start_as_current_span("inference", attributes=attributes):
+        probability = model.phishing_probability(url)
+        if delay > 0:
+            time.sleep(delay)
+    instruments.worker_inference.record(time.perf_counter() - started)
     return probability
+
+
+async def save_result(pool: asyncpg.Pool, task: TaskMessage, result: TaskResult) -> bool:
+    """Запись результата в своём спане: ошибка базы видна в трейсе со статусом ERROR."""
+    attributes = {
+        "db.system.name": "postgresql",
+        "task.id": str(task.task_id),
+        "task.source": task.source,
+    }
+    with telemetry.tracer().start_as_current_span("db.save_result", attributes=attributes) as span:
+        written = await tasks_repo.save_result(
+            pool, task.task_id, task.url, task.source, task.enqueued_at, result
+        )
+        # False — повторная доставка уже готовой задачи
+        span.set_attribute("db.result.written", written)
+        return written
 
 
 async def process(state: WorkerState, task: TaskMessage) -> None:
@@ -87,10 +248,14 @@ async def process(state: WorkerState, task: TaskMessage) -> None:
         raise RuntimeError("Воркер не инициализирован: lifespan не выполнился")
     stats = state.stats
     stats.in_flight += 1
+    instruments.worker_in_flight.add(1)
     try:
         loop = asyncio.get_running_loop()
+        # Копия контекста: в потоке пула тот же текущий спан (process) и тот же task_id
+        context = contextvars.copy_context()
         probability = await loop.run_in_executor(
             state.executor,
+            context.run,
             score,
             state.model,
             task.url,
@@ -102,31 +267,51 @@ async def process(state: WorkerState, task: TaskMessage) -> None:
             model_version=state.model.version,
         )
         try:
-            written = await tasks_repo.save_result(
-                state.db_pool, task.task_id, task.url, task.source, task.enqueued_at, result
-            )
+            written = await save_result(state.db_pool, task, result)
         except RETRYABLE_ERRORS as exc:
             stats.retried += 1
-            log.warning(
-                "Задача %s: результат не записан (%s), вернём в очередь",
-                task.task_id,
-                type(exc).__name__,
-            )
+            # Номер попытки и task_id — из contextvars (TaskContextMiddleware)
+            log.warning("Результат не записан, задача вернётся в очередь", exc_info=exc)
             raise RejectMessage(requeue=True) from exc
 
         if written:
             stats.processed += 1
+            # Для SLO: сколько задача шла от постановки в очередь до результата в базе
+            instruments.worker_task_duration.record(
+                (datetime.now(UTC) - task.enqueued_at).total_seconds()
+            )
+            log.info(
+                "Задача обработана",
+                extra={"model_version": result.model_version, "is_phishing": result.is_phishing},
+            )
         else:
             # Повторная доставка уже готовой задачи: результат не трогаем, просто ack
             stats.duplicates += 1
-            log.info("Задача %s уже готова, повторная доставка", task.task_id)
+            log.info("Задача уже готова, повторная доставка: результат не меняем")
     finally:
         stats.in_flight -= 1
+        instruments.worker_in_flight.add(-1)
 
 
 def build_worker(settings: Settings) -> Worker:
     state = WorkerState(settings=settings)
-    broker = RabbitBroker(settings.rabbitmq_url, graceful_timeout=settings.worker_graceful_timeout)
+
+    def task_context(msg: RawMessage | None, /, *, context: ContextRepo) -> TaskContextMiddleware:
+        return TaskContextMiddleware(msg, context=context, state=state)
+
+    broker = RabbitBroker(
+        settings.rabbitmq_url,
+        graceful_timeout=settings.worker_graceful_timeout,
+        # Порядок важен: телеметрия снаружи, тогда TaskContextMiddleware работает внутри
+        # спана process и пишет в него попытку и DLQ, а записи лога получают trace_id
+        middlewares=[telemetry_middleware(), task_context],
+        # Свои строки FastStream о каждом сообщении («Received», «Processed», ошибка со
+        # стектрейсом) дублируют TaskContextMiddleware, где есть task_id и попытка, —
+        # опускаем их до DEBUG. Логгер не отключаем: через него FastStream пишет CRITICAL,
+        # если не удался сам ack или reject (канал закрылся при остановке или рестарте брокера)
+        logger=BROKER_LOGGER,
+        log_level=logging.DEBUG,
+    )
 
     @broker.subscriber(
         TASKS_QUEUE,
@@ -144,8 +329,19 @@ def build_worker(settings: Settings) -> Worker:
         Без модели воркер не стартует: брать задачи, которые нечем считать,
         бессмысленно. Закрывается после того, как брокер дождался задач в работе.
         """
-        logging_config.setup_logging(settings.log_level)
         state.model = await asyncio.to_thread(ml.load_model, settings)
+        log.info(
+            "Модель загружена: %s v%s (@%s)",
+            state.model.name,
+            state.model.version,
+            state.model.alias,
+            extra={
+                "model_name": state.model.name,
+                "model_alias": state.model.alias,
+                "model_version": state.model.version,
+                "model_run_id": state.model.run_id,
+            },
+        )
         state.executor = ThreadPoolExecutor(
             settings.worker_pool_size, thread_name_prefix="inference"
         )
@@ -154,10 +350,7 @@ def build_worker(settings: Settings) -> Worker:
         )
         await tasks_repo.ensure_schema(state.db_pool)
         log.info(
-            "Воркер готов: модель %s v%s (@%s), пул %d, prefetch %s, задержка %.2f с",
-            state.model.name,
-            state.model.version,
-            state.model.alias,
+            "Воркер готов: пул %d, prefetch %s, задержка %.2f с",
             settings.worker_pool_size,
             settings.worker_prefetch or "без ограничения",
             settings.inference_delay_seconds,
@@ -167,7 +360,7 @@ def build_worker(settings: Settings) -> Worker:
         finally:
             state.executor.shutdown(wait=True)
             await state.db_pool.close()
-            log.info("Воркер остановлен: %s", asdict(state.stats))
+            log.info("Ресурсы воркера закрыты", extra=asdict(state.stats))
 
     @get
     async def stats(scope: object) -> AsgiResponse:
@@ -183,8 +376,35 @@ def build_worker(settings: Settings) -> Worker:
         asgi_routes=[("/health", make_ping_asgi(broker, timeout=2.0)), ("/stats", stats)],
         lifespan=lifespan,
     )
+
+    @app.on_shutdown
+    def shutdown_started() -> None:
+        # SIGTERM: брокер перестаёт брать задачи и ждёт взятые не дольше graceful_timeout
+        log.info(
+            "Остановка воркера: новые задачи не берём, ждём %d в работе (до %.0f с)",
+            state.stats.in_flight,
+            settings.worker_graceful_timeout,
+            extra={"in_flight": state.stats.in_flight},
+        )
+
+    @app.after_shutdown
+    def shutdown_finished() -> None:
+        log.info(
+            "Воркер остановлен: в работе осталось %d",
+            state.stats.in_flight,
+            extra=asdict(state.stats),
+        )
+
     return Worker(broker=broker, app=app, state=state)
 
 
-worker = build_worker(get_settings())
+_settings = get_settings()
+# При импорте: `faststream run` пишет о старте раньше lifespan
+logging_config.setup_logging(_settings.log_level, "worker", _settings.environment)
+_telemetry = telemetry.setup_telemetry(
+    "worker", inference_delay=_settings.inference_delay_seconds, instrument_asyncpg=True
+)
+worker = build_worker(_settings)
+# После остановки брокера: спаны последних задач уходят в Collector
+worker.app.after_shutdown(_telemetry.shutdown)
 app = worker.app

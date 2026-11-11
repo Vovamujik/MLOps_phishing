@@ -4,8 +4,8 @@
 API на FastAPI принимает задачи и кладёт их в ограниченную очередь RabbitMQ,
 воркер на FastStream считает их моделью из MLflow Model Registry
 (`phishing-url-clf@champion`, загружается один раз при старте воркера) и пишет
-результат в Postgres. Подробнее — в разделах [Конвейер задач](#конвейер-задач)
-и [MLflow](#mlflow).
+результат в Postgres. Подробнее — в разделах [Конвейер задач](#конвейер-задач),
+[Наблюдаемость](#наблюдаемость) и [MLflow](#mlflow).
 
 ## Быстрый старт
 
@@ -176,7 +176,8 @@ uv run python -m experiments.plot            # графики и summary.md в e
 - **Глубина очереди держится у лимита.** С ограничениями в системе максимум 109
   задач (`depth.png`): до 101 готовой и до 8 у двух воркеров. 101 — это лимит 100
   плюс одно сообщение, так работает quorum-очередь: после 101-го она отвечает
-  nack. Без ограничений максимум 2936, из них 948 готовых и 2000 у воркера.
+  nack. Без ограничений в системе максимум 2936 задач. Это не сумма пиков: готовых
+  было до 948 (на 4.3 с), неподтверждённых у воркера до 2000 (на 8.6 с) — в разные моменты.
 - **Источник идёт в темпе воркеров, и настраивать его не нужно.** С одним
   воркером источник принимал 19.3 задач/с при обработке 18.8 (`rates.png`),
   со вторым 37.0 против 37.9. Частоты в конфиге нет: источник ждёт ack
@@ -199,8 +200,10 @@ uv run python -m experiments.plot            # графики и summary.md в e
   4.8 с, с двумя воркерами около 88 / 37.9 ≈ 2.3 с. Верхняя граница с одним
   воркером (101 + 4) / 20 + 0.2 ≈ 5.5 с совпадает с p95. Без ограничений
   каждая задача ждёт все предыдущие: среднее 30.71 с, p95 55.1 с с одним
-  воркером и 110.21 с, p95 148.7 с с двумя, потому что к моменту запуска
-  второго воркера бэклог не уменьшился.
+  воркером и 110.21 с, p95 148.7 с с двумя. Второй воркер здесь не помогает:
+  источник выгрузил всю партию за ~3 с, а первый воркер сразу забрал 2000
+  неподтверждённых (prefetch не задан), так что второму почти нечего брать —
+  на 60-й секунде в системе всё ещё 1877 задач.
 - **Ограничения не замедляют обработку партии.** Все 3000 задач обработаны за
   112.3 с против 157.1 с без ограничений: выигрыш даёт ровно распределение
   работы между воркерами (prefetch равен пулу), а не размер очереди.
@@ -273,6 +276,7 @@ uv run pre-commit run --all-files
 |---|---|
 | `lint` | `uv lock --check`, `ruff check`, `ruff format --check`, все хуки pre-commit |
 | `test` | pytest с покрытием (падает ниже 80%) |
+| `observability` | конфиги наблюдаемости проверяют сами инструменты тех же версий, что на стенде: `docker compose --profile … config` для всех профилей, `promtool check config`, `alloy validate`, `otelcol validate`, `loki -verify-config`, `tempo -config.verify`. Правила лабы, которых инструменты не знают (единицы на панелях, `rate` у счётчиков, `for` у алертов, закреплённые образы, лимиты памяти, лейблы Loki), проверяет `tests/test_observability_config.py` в job `test` |
 | `smoke` | поднимает MLflow, регистрирует игрушечную seed-модель как `@champion`, `docker compose up --wait` (API, RabbitMQ, воркер), запросы к эндпоинтам и задача через `POST /api/v1/tasks`, которая доходит до `DONE` с версией модели 1 |
 
 ### CD — `.github/workflows/cd.yml`
@@ -314,24 +318,305 @@ git tag "v$(uv version --short)"
 git push && git push --tags
 ```
 
-## Логирование
+## Наблюдаемость
 
-Формат: `время | уровень | request_id | логгер | сообщение`. Middleware
-присваивает каждому запросу 8-символьный id, возвращает его в заголовке
-`X-Request-ID` и подмешивает во все записи лога этого запроса.
+Конвейер наблюдаем по трём сигналам: по логам, трейсам и метрикам видно и
+систему целиком (очередь у лимита, скорость источника, DLQ), и любую задачу
+(где она, сколько ждала в очереди, сколько считалась). Сервисы приложения
+не знают о хранилищах: логи пишут в stdout, трейсы и метрики отправляют по
+OTLP в Collector.
 
-Каждый запрос пишется одной строкой с методом, путём, статусом, временем
-ответа и IP клиента. Уровень зависит от ответа: 5xx — ERROR (кроме 503 с
-`Retry-After`: очередь заполнена, это штатный сброс нагрузки — WARNING),
-4xx — WARNING, остальное — INFO. Запрос, упавший с необработанным исключением, тоже пишется:
-на ERROR, с `exception=<тип>`, а traceback следом печатает uvicorn.
-Успешные запросы к `/healthz` пишутся на DEBUG — их каждые
-10 секунд делает Docker HEALTHCHECK. Access-лог uvicorn выключен: он дублировал
-запись middleware, но без `request_id`.
+```
+ api ─┐  stdout JSON ──────────▶ Alloy ──▶ Loki ─────────┐
+ worker ┤                                                 │
+ source ┘  OTLP/HTTP ──▶ OTel Collector ─┬─▶ Tempo ───────┼──▶ Grafana
+                     (memory_limiter → batch)              │   (дашборд, алерты,
+ rabbitmq :15692 ◀── scrape ── Prometheus ◀── OTLP ───────┘    лог ↔ трейс ↔ метрика)
+```
+
+### Запуск
 
 ```bash
-docker compose logs -f app
+docker compose up -d                          # только приложение, логи в stdout
+docker compose --profile logs up -d           # + Alloy и Loki
+docker compose --profile traces up -d         # + Collector и Tempo
+docker compose --profile metrics up -d        # + Collector и Prometheus
+docker compose --profile observability up -d  # всё, включая Grafana
 ```
+
+Grafana: http://localhost:3000 (анонимный просмотр, `admin`/`admin` — пароль
+стенда из `.env.example`), дашборд «Конвейер» открывается домашним.
+Prometheus для PromQL: http://localhost:9090.
+
+Стек описан в [`observability/compose.yaml`](observability/compose.yaml), он
+подключается из `docker-compose.yml` через `include`, и у каждого его сервиса
+есть `profiles`. `depends_on` приложения на него не ссылается: без Collector
+SDK копит спаны в ограниченной очереди (2048, лишнее отбрасывает) и шлёт их из
+фонового потока, ответы API не замедляются (проверено: 202 за ~7 мс с
+остановленным Collector), ошибка экспорта пишется в лог не чаще раза в минуту.
+`OTEL_SDK_DISABLED=true` выключает SDK совсем.
+
+`docker compose --profile observability stop` без списка сервисов
+останавливает и приложение. Только наблюдаемость:
+`docker compose stop alloy loki otel-collector tempo prometheus grafana`.
+
+### Почему Loki, Tempo и Prometheus
+
+- Это нативные datasource Grafana: переходы лог → трейс (derived field),
+  трейс → логи (`tracesToLogsV2`) и график → трейс (exemplars) работают без
+  плагинов, и Grafana поднимается с нуля без доступа в интернет.
+- Loki индексирует только лейблы, а не текст: на стенде с тремя лейблами
+  индекс крошечный, поиск по `task_id` — фильтр по нескольким потокам.
+  Elasticsearch индексирует каждое поле и требует heap от гигабайта; VictoriaLogs
+  ищет по полям дешевле, но в Grafana нужен её плагин.
+- Весь профиль `observability` укладывается в 1,44 ГиБ лимитов (таблица ниже).
+
+### Логи
+
+Одна JSON-строка на запись, единый набор полей у api, worker, source и у
+библиотек (uvicorn, faststream, aio_pika, asyncpg, mlflow):
+
+```json
+{"timestamp": "2026-11-11T10:19:09.655Z", "level": "info", "service": "worker", "env": "development",
+ "logger": "mlops_phishing.worker", "message": "Задача обработана", "task_id": "22592702-…",
+ "attempt": 1, "model_version": "1", "is_phishing": true,
+ "trace_id": "482e068c260dbbf07832b66d453696f5", "span_id": "3515dba1e8d6098e"}
+```
+
+- **structlog поверх stdlib.** `ProcessorFormatter` прогоняет через одну
+  цепочку и наши записи, и чужие, поэтому логи библиотек в том же формате.
+  Контекст задачи — встроенный `merge_contextvars`. python-json-logger — только
+  форматтер: контекст, trace_id и маскирование паролей пришлось бы дописывать.
+  Подробнее — docstring [`logging_config.py`](src/mlops_phishing/logging_config.py).
+- **task_id едет через RabbitMQ** в `correlation_id` (и `message_id`).
+  Middleware воркера кладёт его и номер попытки в contextvars на время
+  сообщения, поэтому он есть в каждой записи обработчика, а руками его никто
+  не дописывает. API добавляет `request_id`, источник — `row`.
+- **trace_id и span_id** процессор берёт из текущего спана OpenTelemetry.
+- **Секреты:** пароль в любом URL (DSN Postgres, AMQP) маскируется во всех
+  полях, включая стектрейс. URL из CSV в лог не пишется.
+- **Уровень** — `LOG_LEVEL`. Успешные health-check (`/healthz`,
+  `/api/v1/health`) пишутся на DEBUG.
+
+| Событие | Уровень | Поля |
+|---|---|---|
+| модель загружена | INFO | `model_alias`, `model_version`, `model_run_id` |
+| брокер отказал, источник замедлился | INFO (первый отказ серии), DEBUG (остальные) | `attempt`, `delay` |
+| скорость источника раз в 5 с | INFO | задач/с, отказов за 5 с |
+| ответ 503 | WARNING | `retry_after`, `task_id` |
+| ошибка записи результата, задача вернётся в очередь | WARNING + стектрейс | `attempt` |
+| перевод в DLQ | ERROR (+ стектрейс у битого сообщения) | `attempt`, `delivery_limit` |
+| начало и конец graceful shutdown | INFO | `in_flight`, итоговые счётчики |
+
+**Лейблы Loki — только `service`, `level`, `env`.** Каждая комбинация
+лейблов — отдельный поток со своим индексом и чанками. `task_id` дал бы поток
+на каждую задачу: после файла в 6000 строк — 6000 потоков по одной-две строки,
+индекс раздувается, а запрос «ошибки за 15 минут» перебирает их все. Поэтому
+`task_id` и `trace_id` лежат в structured metadata записи
+([`alloy/config.alloy`](observability/alloy/config.alloy)): поиск
+`{service=~".+"} | task_id="…"` сначала сужает до трёх потоков, потом
+фильтрует строки.
+
+### Трейсы
+
+Одна задача — один трейс через все процессы (снято с живого стенда):
+
+```
+api     POST /api/v1/tasks              4.6 ms
+api       default.tasks create
+api         default.tasks publish       2.0 ms   ← traceparent в заголовках сообщения
+api       INSERT (PENDING)              0.6 ms
+worker  default.tasks process         209.8 ms   ← +5128 ms: столько задача ждала в очереди
+worker    inference                   206.5 ms   (model.alias, model.version)
+worker    db.save_result                1.7 ms
+worker      INSERT                      0.8 ms
+```
+
+- SDK OpenTelemetry, экспорт OTLP/HTTP в Collector (`memory_limiter` первым:
+  он отказывает приёму до того, как батч займёт память; затем `batch`).
+  `service.name` = api / worker / source, `service.version`,
+  `deployment.environment.name` — из `OTEL_*`, `service.instance.id` —
+  hostname контейнера, поэтому две реплики воркера различимы.
+- Через RabbitMQ контекст несёт `RabbitTelemetryMiddleware` FastStream: W3C
+  `traceparent` в заголовках, process воркера продолжает трейс издателя.
+- `run_in_executor` не копирует contextvars, поэтому inference запускается
+  через `contextvars.copy_context().run`: спан `inference` — дочерний к
+  process, а не корневой.
+- Источник: каждая строка — свой корневой трейс `source.task`, отказы брокера
+  — события `broker.rejected` и дочерние спаны `source.backoff` с номером
+  попытки и паузой. Один трейс на пачку дал бы тысячи спанов в одном трейсе.
+- Ошибки: статус ERROR и `record_exception`, номер попытки в
+  `messaging.rabbitmq.delivery_count`, перевод в DLQ — атрибут
+  `messaging.rabbitmq.dead_lettered` и событие `dead_lettered`. Все попытки
+  ядовитого сообщения — в одном трейсе (общий родитель publish). Ответ 503 —
+  трейс со статусом ERROR и записанным `DeliveryError`.
+- Поиск в Tempo: `{span.task.id="<task_id>"}`, ошибки — `{status=error}`.
+
+**Семплер.** Стенд: `OTEL_TRACES_SAMPLER=parentbased_traceidratio` с
+аргументом 1.0 — сохраняется каждый трейс, чтобы найти любой task_id. Прод при
+сотнях задач в секунду: тот же семплер с долей 0.01–0.1 (решение принимает
+начало трейса — API или источник, воркер наследует его через traceparent,
+трейсы не рвутся) плюс tail sampling в Collector — все трейсы с ошибкой и
+медленнее SLO, остальное по доле. Один head-семплинг терял бы большую часть
+ошибок, один tail — гнал бы весь поток спанов через Collector.
+
+### Метрики
+
+| Метрика (в Prometheus) | Тип | Лейблы |
+|---|---|---|
+| `http_server_request_duration_seconds` | histogram | `http_request_method`, `http_route`, `http_response_status_code` |
+| `tasks_queue_limit` | gauge | — |
+| `source_tasks_published_total` | counter | — |
+| `source_broker_rejections_total` | counter | — |
+| `source_backoff_duration_seconds_total` | counter (сумма пауз) | — |
+| `worker_tasks_processed_total` | counter | `result` = ok / error / dlq |
+| `worker_inference_duration_seconds` | histogram | — |
+| `worker_task_duration_seconds` | histogram (от постановки до записи, для SLO) | — |
+| `worker_tasks_in_flight` | gauge | — |
+| `worker_redeliveries_total` | counter | — |
+| `process_memory_usage_bytes` | gauge (system-metrics) | — |
+| `rabbitmq_detailed_queue_messages{,_ready,_unacked}` | gauge (плагин RabbitMQ) | `queue` |
+
+У всех метрик приложения `job` = service.name, `instance` = service.instance.id.
+
+- **Бакеты** подобраны под конфиг, а не по умолчанию: inference — доли от
+  `INFERENCE_DELAY_SECONDS` (при 0.2 с: 0.05, 0.1, 0.15, 0.2, 0.205, 0.21,
+  0.22, 0.23, 0.25, 0.3, 0.4, 0.6, 1, 2), API — 0.005…5 с с границами у
+  таймаута публикации 2 с, задача целиком — 0.25…120 с.
+- **Push для приложения, pull для RabbitMQ.** Источник — пакетный процесс на
+  минуты: pull-скрейп раз в 5 с мог бы его не застать, а итог партии потерялся
+  бы при выходе; push по OTLP отправляет остаток в `shutdown`. Реплики
+  воркера (`--scale worker=2`) не нужно регистрировать в Prometheus. Глубину
+  очередей приложение не считает: Prometheus скрейпит встроенный плагин
+  `rabbitmq:15692/metrics/detailed` (per-queue).
+- **Оценка рядов** (стенд: api, 2 воркера, источник) — произведение значений лейблов:
+
+| Метрика | Расчёт | Рядов |
+|---|---|---|
+| HTTP-гистограмма | ~8 комбинаций метод × маршрут × код × (12 бакетов + sum + count) | ~112 |
+| inference | 2 воркера × (15 бакетов + 2) | 34 |
+| задача целиком | 2 × (14 + 2) | 32 |
+| processed | 2 × 3 результата | 6 |
+| in_flight, redeliveries | 2 × 2 | 4 |
+| источник, лимит | 3 + 1 | 4 |
+| память, CPU, target_info | 4 + 8 + 4 | 16 |
+| **итого** | | **~210** |
+
+  Лейбл `task_id` после файла в 6000 строк: одна гистограмма inference дала
+  бы 6000 × 17 ≈ 102 тыс. рядов, каждый счётчик — ещё 6000, и все они живут
+  в head Prometheus, пока не уйдут из retention.
+
+PromQL выводов прошлой работы (на стенде с одним, затем двумя воркерами):
+
+```promql
+sum(rate(source_tasks_published_total[20s]))                     # скорость источника
+sum(rate(worker_tasks_processed_total{job="worker"}[20s]))       # пропускная способность воркеров
+sum by (instance)(rate(worker_tasks_processed_total[20s]))       # по воркерам
+histogram_quantile(0.95, sum by (le)(rate(worker_inference_duration_seconds_bucket[1m])))
+```
+
+Прогон 3000 задач: со вторым воркером источник 35.7 задач/с при 18.5 + 18.6
+у воркеров, p95 inference 0.212 с.
+
+### Grafana
+
+Всё настроено файлами: datasources, дашборд и алерты в
+[`observability/grafana/`](observability/grafana/) поднимаются после
+`docker compose down -v` и `up` без единого клика.
+
+Дашборд «Конвейер» ([`pipeline.json`](observability/grafana/dashboards/pipeline.json)):
+глубина `tasks` и `tasks.dlq` с линией лимита `tasks_queue_limit`, скорость
+источника против суммарной пропускной способности воркеров на одном графике и
+разбивка по воркерам, p50/p95/p99 inference, ответа API и задачи целиком
+(с exemplars → трейс), память процессов, доля 503, отказы брокера, рост DLQ,
+задачи в работе, последние ошибки из Loki и трейсы с ошибками из Tempo.
+Переменные — сервис и экземпляр воркера; у всех панелей единицы, у счётчиков
+`rate`.
+
+Корреляция: из записи Loki кнопка `trace_id` открывает трейс в Tempo, из
+спана — «Logs for this span» показывает логи всего трейса, с графика латентности
+exemplar ведёт к трейсу.
+
+| Алерт | Условие | `for` | Почему так |
+|---|---|---|---|
+| Очередь заполнена > 90% | `max_over_time(ready{queue="tasks"}[30s]) / tasks_queue_limit > 0.9` | 1m | При reject-publish глубина пилит между 80% (там очередь снова принимает) и лимитом. Мгновенное значение проваливалось ниже 90% и сбрасывало `for` — алерт не доходил до Firing. Максимум за 30 с отвечает «упиралась ли очередь в лимит»; минута отсекает нормальный всплеск пачки |
+| В DLQ появились сообщения | `delta(messages{queue="tasks.dlq"}[5m]) > 0` | 30s | Любое сообщение в DLQ — задача после всех попыток, нужен человек. Не «глубина > 0»: старые сообщения держали бы алерт вечно и скрыли новые. 30 с — защита от артефакта одного скрейпа |
+| SLO: быстрое сжигание бюджета | burn rate > 14.4 и за 5 мин, и за 1 мин | 1m | Multiwindow из SRE workbook: длинное окно подтверждает, что это не всплеск, короткое — что проблема ещё идёт (алерт гаснет сразу после починки). В проде окна 1 ч и 5 мин, стенд живёт минуты — окна уменьшены в 12 раз. 14.4 — 2% месячного бюджета за час. Алерт на симптом (задачи медленные), а не на причину |
+| Prometheus не видит RabbitMQ | `up{job="rabbitmq"} < 1` | 1m | Без него алерты на очередь и DLQ при потере скрейпа молча уходят в NoData → OK. Минута — перезапуск брокера (10–20 с) не будит |
+
+### SLO и error budget
+
+SLO стенда: **99% задач — от постановки в очередь до записи результата — быстрее
+10 с** (`worker_task_duration_seconds`, у гистограммы есть граница `le="10"`).
+С одним воркером и лимитом очереди 100 задача ждёт около 5 с, запас двукратный.
+
+```promql
+# SLI: доля задач быстрее 10 с
+sum(rate(worker_task_duration_seconds_bucket{job="worker", le="10"}[5m]))
+  / sum(rate(worker_task_duration_seconds_count{job="worker"}[5m]))
+# остаток бюджета за окно: 1 − доля медленных / 1%
+1 - (1 - sum(increase(…_bucket{le="10"}[1h])) / sum(increase(…_count[1h]))) / 0.01
+# burn rate: во сколько раз быстрее нормы тратится бюджет
+(1 - SLI) / 0.01
+```
+
+Бюджет ошибок — 1% задач за окно, их можно «потратить» на медленные задачи без
+нарушения SLO. Burn rate 1 — бюджет кончится ровно к концу окна, 14.4 — 30-дневный
+бюджет уходит за 2 дня. На дашборде — ряд «SLO»: SLI с линией 99%, остаток бюджета
+за 1 ч (окно стенда; в проде — 30 дней) и burn rate за 1 и 5 минут.
+
+Проверка на стенде: `INFERENCE_DELAY_SECONDS=0.5 docker compose up -d worker`, затем
+источник. Очередь у лимита держит задачу около 100 × 0.5 / 4 = 12.5 с — дольше SLO;
+алерт быстрого сжигания ушёл в Firing с burn rate 92 (5 мин) и 100 (1 мин).
+
+### Бюджет памяти
+
+| Сервис | `mem_limit` | `docker stats` под нагрузкой |
+|---|---|---|
+| alloy | 160 MiB | 76 MiB |
+| loki | 256 MiB | 110 MiB |
+| otel-collector | 160 MiB | 87 MiB |
+| tempo | 256 MiB | 175 MiB |
+| prometheus | 256 MiB | 50 MiB |
+| grafana | 384 MiB | 269 MiB |
+| **итого** | **1472 MiB (1,44 ГиБ)** | **767 MiB** |
+
+Одноразовый `hc-tools` (лимит 16 MiB) копирует busybox в том и сразу завершается,
+в постоянный бюджет он не входит.
+
+Замер — прогон 4000 задач источником и поток `POST /api/v1/tasks` на полной
+очереди. Retention: Loki, Tempo и Prometheus — 2 суток. Образы закреплены по
+версиям (`.env.example`), данные — в именованных томах, у хранилищ и Grafana
+есть healthcheck. У Loki, Tempo и Collector в образах нет shell, поэтому их
+healthcheck — статический busybox из одноразового сервиса `hc-tools`.
+
+### Сценарии защиты
+
+Скрипты в [`demo/`](demo/) создают ситуацию и печатают, где искать её след:
+
+```bash
+uv run python -m demo.poison              # битое сообщение в tasks → DLQ с первой попытки, алерт DLQ
+uv run python -m demo.flood --requests 300  # поток POST при полной очереди: коды, Retry-After, request_id 503
+uv run python -m demo.series --rows 6000  # ряды метрик сейчас и с лейблом task_id
+```
+
+На стенде (очередь у лимита): `flood` — 105 ответов 202 и 195 ответов 503 с
+`Retry-After: 1` за 0.6 с, по `request_id` отказа в Loki находится запись с
+`trace_id`; `series` — 102 ряда сейчас, с `task_id` после 6000 строк добавится
+≈ 318 тыс. (гистограмма inference — 6000 × 17 = 102 тыс.). Повторы до
+delivery-limit и DLQ показывает остановленный Postgres: `docker compose stop
+postgres`, затем задача через API.
+
+### Ограничения
+
+- `docker compose down -v` стирает и реестр MLflow: перед воркером нужна
+  модель, на стенде — `uv run --group ml python -m training.seed_ci_model`
+  после `docker compose up -d --wait mlflow`.
+- Имя проекта `mlops-phishing` зашито в фильтр Alloy: с `-p другое-имя` логи
+  собираться не будут.
+- Метрики источника приходят с новым `instance` на каждый запуск, на
+  дашборде он агрегируется по `job`. После перезапуска воркера старые ряды
+  ещё до 5 минут видны в разбивке по экземплярам.
 
 ## MLflow
 

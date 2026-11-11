@@ -1,10 +1,30 @@
 name: mlops-phishing
 
+# Стек наблюдаемости (Loki, Tempo, Prometheus, Collector, Alloy, Grafana). Все его сервисы —
+# с profiles, поэтому `docker compose up -d` поднимает только приложение. Включение:
+# docker compose --profile observability up -d (или по частям: logs / traces / metrics)
+include:
+  - observability/compose.yaml
+
 x-logging: &default-logging
   driver: json-file
   options:
     max-size: "10m"
     max-file: "3"
+
+# Телеметрия приложения: только переменные OTEL_*, адресов в коде нет. Collector не запущен —
+# SDK экспортирует в фоне и теряет данные, сервис не падает и не ждёт. Выключить совсем:
+# OTEL_SDK_DISABLED=true. OTEL_SERVICE_NAME у каждого сервиса свой
+x-otel-env: &otel-env
+  OTEL_SDK_DISABLED: ${OTEL_SDK_DISABLED:-false}
+  OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4318}
+  OTEL_EXPORTER_OTLP_PROTOCOL: ${OTEL_EXPORTER_OTLP_PROTOCOL:-http/protobuf}
+  # service.instance.id не задаём: код берёт hostname контейнера, у реплик воркера он разный
+  OTEL_RESOURCE_ATTRIBUTES: ${OTEL_RESOURCE_ATTRIBUTES:-deployment.environment.name=${ENVIRONMENT:-development}}
+  OTEL_TRACES_SAMPLER: ${OTEL_TRACES_SAMPLER:-parentbased_traceidratio}
+  OTEL_TRACES_SAMPLER_ARG: ${OTEL_TRACES_SAMPLER_ARG:-1.0}
+  # Миллисекунды: как scrape_interval Prometheus, иначе 60-секундный эксперимент — пара точек
+  OTEL_METRIC_EXPORT_INTERVAL: ${OTEL_METRIC_EXPORT_INTERVAL:-5000}
 
 services:
   postgres:
@@ -35,6 +55,8 @@ services:
     image: mlops-phishing:local
     restart: unless-stopped
     environment:
+      <<: *otel-env
+      OTEL_SERVICE_NAME: api
       DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-mlops_phishing}
       ENVIRONMENT: ${ENVIRONMENT:-development}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
@@ -105,8 +127,11 @@ services:
     restart: unless-stopped
     command: ["faststream", "run", "mlops_phishing.worker:app", "--host", "0.0.0.0", "--port", "8001"]
     environment:
+      <<: *otel-env
+      OTEL_SERVICE_NAME: worker
       RABBITMQ_URL: amqp://${RABBITMQ_USER:-app}:${RABBITMQ_PASSWORD:-app}@rabbitmq:5672/
       DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-mlops_phishing}
+      ENVIRONMENT: ${ENVIRONMENT:-development}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       MLFLOW_TRACKING_URI: http://mlflow:5000
       MODEL_NAME: ${MODEL_NAME:-phishing-url-clf}
@@ -116,6 +141,8 @@ services:
       WORKER_PREFETCH: ${WORKER_PREFETCH:-4}
       INFERENCE_DELAY_SECONDS: ${INFERENCE_DELAY_SECONDS:-0.2}
       WORKER_GRACEFUL_TIMEOUT: ${WORKER_GRACEFUL_TIMEOUT:-30}
+      # Как у очереди (rabbitmq-init): по нему воркер понимает, что попытка последняя и дальше DLQ
+      TASKS_DELIVERY_LIMIT: ${TASKS_DELIVERY_LIMIT:-3}
     # Больше graceful timeout воркера: Docker не добьёт SIGKILL, пока задачи дописываются
     stop_grace_period: 40s
     # Healthcheck образа смотрит на /healthz приложения, у воркера свой /health
@@ -141,7 +168,10 @@ services:
     profiles: ["source"]
     entrypoint: ["python", "-m", "mlops_phishing.source"]
     environment:
+      <<: *otel-env
+      OTEL_SERVICE_NAME: source
       RABBITMQ_URL: amqp://${RABBITMQ_USER:-app}:${RABBITMQ_PASSWORD:-app}@rabbitmq:5672/
+      ENVIRONMENT: ${ENVIRONMENT:-development}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       SOURCE_BACKOFF_INITIAL: ${SOURCE_BACKOFF_INITIAL:-0.05}
       SOURCE_BACKOFF_MAX: ${SOURCE_BACKOFF_MAX:-1.0}

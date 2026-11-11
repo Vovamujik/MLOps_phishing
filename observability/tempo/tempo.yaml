@@ -1,0 +1,46 @@
+# Tempo 2, монолит с локальным хранилищем блоков — для стенда.
+
+stream_over_http_enabled: true
+
+server:
+  http_listen_port: 3200
+  grpc_listen_port: 9095
+  log_level: warn
+
+distributor:
+  receivers:
+    # Collector шлёт по OTLP/gRPC; HTTP оставлен для отладки (curl с JSON-спаном)
+    otlp:
+      protocols:
+        grpc:
+          endpoint: 0.0.0.0:4317
+        http:
+          endpoint: 0.0.0.0:4318
+
+ingester:
+  # Трейсы задачи живут секунды: блок сбрасывается на диск часто, память не копится
+  trace_idle_period: 10s
+  max_block_duration: 5m
+
+compactor:
+  compaction:
+    # Retention стенда — 2 дня
+    block_retention: 48h
+
+storage:
+  trace:
+    backend: local
+    wal:
+      path: /var/tempo/wal
+    local:
+      path: /var/tempo/blocks
+
+overrides:
+  defaults:
+    ingestion:
+      rate_limit_bytes: 5000000
+      burst_size_bytes: 10000000
+      max_traces_per_user: 20000
+
+usage_report:
+  reporting_enabled: false

@@ -1,11 +1,14 @@
 """Общие фикстуры тестов."""
 
 import asyncio
+import io
+import json
 import logging
 import threading
 import tomllib
 from collections.abc import AsyncIterator, Callable, Iterator
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -14,14 +17,19 @@ from aio_pika.exceptions import DeliveryError, PublishError
 from aiormq.abc import DeliveredMessage
 from asgi_lifespan import LifespanManager
 from httpx import ASGITransport, AsyncClient
+from opentelemetry.sdk.trace import ReadableSpan
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from pamqp.commands import Basic
 from pamqp.header import ContentHeader
 
 from mlops_phishing.app import app
 from mlops_phishing.config import Settings, get_settings
+from mlops_phishing.logging_config import build_formatter
 from mlops_phishing.messaging import TaskMessage
 from mlops_phishing.metadata import get_version
 from mlops_phishing.ml import LoadedModel
+
+from . import METRICS, SPANS
 
 PYPROJECT = Path(__file__).resolve().parents[1] / "pyproject.toml"
 
@@ -165,6 +173,79 @@ def restore_root_logger() -> Iterator[None]:
     yield
     root.handlers = handlers
     root.setLevel(level)
+
+
+class JsonLog:
+    """Записи логов в том виде, в каком их увидит Loki: разобранные JSON-строки."""
+
+    def __init__(self) -> None:
+        self.stream = io.StringIO()
+
+    @property
+    def records(self) -> list[dict[str, object]]:
+        return [json.loads(line) for line in self.stream.getvalue().splitlines()]
+
+    @property
+    def text(self) -> str:
+        return self.stream.getvalue()
+
+    def find(self, message_part: str) -> list[dict[str, object]]:
+        """Записи, в тексте которых есть подстрока."""
+        return [r for r in self.records if message_part in str(r["message"])]
+
+
+@pytest.fixture
+def spans() -> Iterator[InMemorySpanExporter]:
+    """Спаны, законченные за время теста (провайдер с экспортом в память — tests/__init__)."""
+    SPANS.clear()
+    yield SPANS
+    SPANS.clear()
+
+
+def span_named(exporter: InMemorySpanExporter, name: str) -> ReadableSpan:
+    """Единственный законченный спан с таким именем."""
+    [span] = [span for span in exporter.get_finished_spans() if span.name == name]
+    return span
+
+
+def metric_points(name: str, **attributes: object) -> list[Any]:
+    """Точки метрики (кумулятивные, с начала прогона) с заданными атрибутами."""
+    data = METRICS.get_metrics_data()
+    points = [
+        point
+        for resource in (data.resource_metrics if data else [])
+        for scope in resource.scope_metrics
+        for metric in scope.metrics
+        if metric.name == name
+        for point in metric.data.data_points
+    ]
+    return [p for p in points if all(p.attributes.get(k) == v for k, v in attributes.items())]
+
+
+def metric_value(name: str, **attributes: object) -> float:
+    """Сумма счётчика; тесты сравнивают до и после, метрики копятся за весь прогон."""
+    return sum(point.value for point in metric_points(name, **attributes))
+
+
+def histogram_count(name: str, **attributes: object) -> int:
+    return sum(point.count for point in metric_points(name, **attributes))
+
+
+@pytest.fixture
+def json_log() -> Iterator[JsonLog]:
+    """Перехват логов через тот же JSON-форматтер, что у приложения, с уровня DEBUG.
+
+    Обработчик вешается на корневой логгер рядом с остальными; restore_root_logger
+    вернёт уровень после теста.
+    """
+    captured = JsonLog()
+    handler = logging.StreamHandler(captured.stream)
+    handler.setFormatter(build_formatter("test-service", "test"))
+    root = logging.getLogger()
+    root.addHandler(handler)
+    root.setLevel(logging.DEBUG)
+    yield captured
+    root.removeHandler(handler)
 
 
 @pytest.fixture

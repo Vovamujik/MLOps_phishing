@@ -1,0 +1,71 @@
+# Loki 3, монолит (single binary) с файловым хранилищем — для стенда больше не нужно.
+
+auth_enabled: false
+
+server:
+  http_listen_port: 3100
+  grpc_listen_port: 9096
+  log_level: warn
+
+common:
+  instance_addr: 127.0.0.1
+  path_prefix: /loki
+  replication_factor: 1
+  storage:
+    filesystem:
+      chunks_directory: /loki/chunks
+      rules_directory: /loki/rules
+  ring:
+    kvstore:
+      store: inmemory
+
+schema_config:
+  configs:
+    # TSDB + schema v13 — обязательны для structured metadata (task_id, trace_id)
+    - from: 2024-01-01
+      store: tsdb
+      object_store: filesystem
+      schema: v13
+      index:
+        prefix: index_
+        period: 24h
+
+limits_config:
+  # Короткий retention стенда: 2 дня. Удаляет компактор (ниже retention_enabled)
+  retention_period: 48h
+  # task_id и trace_id едут как structured metadata — поля записи, а не лейблы
+  allow_structured_metadata: true
+  volume_enabled: true
+  # Строки старше retention не принимаем: их всё равно удалит компактор
+  reject_old_samples: true
+  reject_old_samples_max_age: 48h
+  ingestion_rate_mb: 8
+  ingestion_burst_size_mb: 16
+  # Страховка от кардинальности: лейблы service × level × env дают десятки потоков,
+  # сотни значат, что кто-то вынес в лейбл идентификатор
+  max_global_streams_per_user: 500
+  max_query_series: 1000
+  # Loki 3 сам добавляет лейбл service_name и поле detected_level. Лейблы задаёт агент
+  # (service, level, env) — четвёртый лейбл-дубль не нужен
+  discover_service_name: []
+  discover_log_levels: false
+
+compactor:
+  working_directory: /loki/compactor
+  compaction_interval: 10m
+  retention_enabled: true
+  retention_delete_delay: 1h
+  delete_request_store: filesystem
+
+query_range:
+  results_cache:
+    cache:
+      embedded_cache:
+        enabled: true
+        max_size_mb: 32
+
+pattern_ingester:
+  enabled: false
+
+analytics:
+  reporting_enabled: false

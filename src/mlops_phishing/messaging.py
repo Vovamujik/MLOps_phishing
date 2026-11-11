@@ -5,11 +5,13 @@
 политика переполнения и DLQ задаются policy (см. rabbit_setup).
 """
 
+import logging
 import uuid
 from datetime import datetime
 from typing import Literal
 
 from faststream.rabbit import QueueType, RabbitBroker, RabbitQueue
+from faststream.rabbit.opentelemetry import RabbitTelemetryMiddleware
 from faststream.rabbit.schemas import Channel
 from pydantic import BaseModel, Field
 
@@ -24,6 +26,20 @@ TASKS_QUEUE = RabbitQueue(TASKS_QUEUE_NAME, durable=True, queue_type=QueueType.Q
 # ack или nack, nack при полной очереди — DeliveryError. on_return_raises: если очереди нет,
 # брокер возвращает сообщение, и без флага FastStream молча считает его отправленным
 PUBLISH_CHANNEL = Channel(publisher_confirms=True, on_return_raises=True)
+
+# Служебные записи FastStream издателей: без явного логгера он заводит свой с текстовым
+# обработчиком, а этот пишет через корневой — в общий JSON
+BROKER_LOGGER = logging.getLogger("faststream.access.rabbit")
+
+
+def telemetry_middleware() -> RabbitTelemetryMiddleware:
+    """Трейсинг брокера: W3C traceparent в заголовках сообщения.
+
+    У издателя — спаны create/publish, у воркера — process, продолжающий трейс издателя:
+    задача из API или источника и её обработка — один трейс. Провайдер — глобальный
+    (telemetry.setup_telemetry), без него спаны no-op.
+    """
+    return RabbitTelemetryMiddleware()
 
 
 class TaskMessage(BaseModel):
@@ -43,5 +59,10 @@ async def publish_task(broker: RabbitBroker, task: TaskMessage) -> None:
     очереди нет — PublishError (mandatory по умолчанию). persist для наглядности:
     quorum-очередь и так пишет всё на диск, а сохранность гарантирует confirm — ack
     приходит после записи на большинство узлов.
+
+    correlation_id = message_id = task_id: по нему воркер кладёт task_id в контекст логов.
     """
-    await broker.publish(task, queue=TASKS_QUEUE, message_id=str(task.task_id), persist=True)
+    task_id = str(task.task_id)
+    await broker.publish(
+        task, queue=TASKS_QUEUE, message_id=task_id, correlation_id=task_id, persist=True
+    )

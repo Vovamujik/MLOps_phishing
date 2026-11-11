@@ -22,8 +22,9 @@ from aio_pika.exceptions import DeliveryError, PublishError
 from asgi_lifespan import LifespanManager
 from faststream.rabbit import RabbitBroker
 from httpx import ASGITransport, AsyncClient
+from opentelemetry import trace
 
-from mlops_phishing import rabbit_setup, tasks_repo
+from mlops_phishing import rabbit_setup, tasks_repo, telemetry
 from mlops_phishing.app import app
 from mlops_phishing.config import Settings, get_settings
 from mlops_phishing.messaging import (
@@ -43,7 +44,7 @@ from mlops_phishing.source import (
 )
 from mlops_phishing.worker import Worker, build_worker
 
-from ..conftest import FakeClassifier, make_model
+from ..conftest import FakeClassifier, make_model, span_named
 from .conftest import Rabbit, start_rabbitmq
 
 pytestmark = pytest.mark.integration
@@ -293,11 +294,43 @@ async def test_source_waits_on_full_queue_and_loses_nothing(settings, channel):
     assert max(depths) <= LIMIT + 1
 
 
+# --- Трейс через брокер -----------------------------------------------------
+
+
+async def test_worker_continues_publisher_trace_through_rabbitmq(
+    start_worker, publisher, channel, monkeypatch, spans, json_log
+):
+    """traceparent едет в заголовках настоящего AMQP-сообщения: process — в трейсе API."""
+    monkeypatch.setattr(tasks_repo, "save_result", mock.AsyncMock(return_value=True))
+    worker = await start_worker()
+    task = make_task()
+
+    with telemetry.tracer().start_as_current_span("POST /api/v1/tasks") as request_span:
+        await publisher.publish(task)
+    await wait_until(lambda: worker.state.stats.processed == 1)
+    await wait_until(lambda: any(s.name == "inference" for s in spans.get_finished_spans()))
+
+    trace_id = request_span.get_span_context().trace_id
+    publish = span_named(spans, "default.tasks publish")
+    process = span_named(spans, "default.tasks process")
+    inference = span_named(spans, "inference")
+    assert publish.context.trace_id == process.context.trace_id == trace_id
+    # Родитель process — спан create издателя, у него же родитель publish (так у FastStream)
+    create = span_named(spans, "default.tasks create")
+    assert process.parent.span_id == create.context.span_id
+    assert publish.parent.span_id == create.context.span_id
+    assert inference.parent.span_id == process.context.span_id
+    assert process.attributes["messaging.message.conversation_id"] == str(task.task_id)
+    [done] = json_log.find("Задача обработана")
+    assert done["task_id"] == str(task.task_id)
+    assert done["trace_id"] == trace.format_trace_id(trace_id)
+
+
 # --- Воркер: повторы, DLQ, prefetch, остановка ------------------------------
 
 
 async def test_failing_task_goes_to_dlq_after_delivery_limit(
-    start_worker, publisher, channel, monkeypatch
+    start_worker, publisher, channel, monkeypatch, json_log
 ):
     """База недоступна при каждой попытке: 1 + delivery-limit доставок, потом DLQ."""
     attempts: list[uuid.UUID] = []
@@ -319,6 +352,13 @@ async def test_failing_task_goes_to_dlq_after_delivery_limit(
     assert dead.headers["x-acquired-count"] == DELIVERY_LIMIT + 1
     assert dead.headers["x-first-death-reason"] == "delivery_limit"
     assert await depth(channel, TASKS_QUEUE_NAME) == 0
+    # Номер попытки — из x-delivery-count брокера, task_id — из correlation_id
+    retries = json_log.find("вернётся в очередь")
+    assert [(r["attempt"], r["task_id"]) for r in retries] == [
+        (attempt, str(task.task_id)) for attempt in range(1, DELIVERY_LIMIT + 2)
+    ]
+    [dlq] = json_log.find("переведена в DLQ")
+    assert (dlq["level"], dlq["attempt"]) == ("error", DELIVERY_LIMIT + 1)
 
 
 async def test_malformed_message_goes_to_dlq_without_retries(start_worker, channel, monkeypatch):

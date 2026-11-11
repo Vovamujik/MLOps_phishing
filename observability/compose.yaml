@@ -1,0 +1,222 @@
+# Стек наблюдаемости. Подключается из docker-compose.yml через include, но у КАЖДОГО сервиса
+# есть profiles: обычный `docker compose up -d` его не поднимает, приложение о нём не знает.
+#   docker compose --profile logs up -d           # Alloy + Loki
+#   docker compose --profile traces up -d         # Collector + Tempo
+#   docker compose --profile metrics up -d        # Collector + Prometheus (+ скрейп RabbitMQ)
+#   docker compose --profile observability up -d  # всё вместе + Grafana
+# Пути к конфигам ниже — относительно этой папки (так работает include).
+# Бюджет памяти профиля observability — сумма mem_limit: 160 (alloy) + 256 (loki) + 160 (collector)
+# + 256 (tempo) + 256 (prometheus) + 384 (grafana) = 1472 MiB ≈ 1,44 ГиБ. Плюс 16 MiB у
+# одноразового hc-tools: он копирует busybox и сразу завершается, память не держит.
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  # Loki, Tempo и Collector собраны distroless: в образе нет ни shell, ни wget, ни своего
+  # health-флага. Одноразовый контейнер кладёт статический busybox в общий том, а healthcheck
+  # этих сервисов вызывает /hc/busybox wget. Так проверка честная (HTTP /ready), а образы
+  # остаются официальными, без пересборки.
+  hc-tools:
+    image: busybox:${BUSYBOX_VERSION:-1.37.0-musl}
+    profiles: [logs, traces, metrics, observability]
+    restart: "no"
+    command: ["cp", "/bin/busybox", "/hc/busybox"]
+    volumes:
+      - obs_hc_tools:/hc
+    # Живёт доли секунды, но правило стенда — лимит у каждого сервиса наблюдаемости
+    mem_limit: 16m
+    logging: *default-logging
+
+  # Хранилище логов. Индексирует только лейблы (service, level, env), текст — сжатыми чанками
+  loki:
+    image: grafana/loki:${LOKI_VERSION:-3.7.9}
+    profiles: [logs, observability]
+    restart: unless-stopped
+    command: ["-config.file=/etc/loki/loki.yaml"]
+    environment:
+      # Go отдаёт память раньше, чем упрётся в mem_limit и словит OOM-kill
+      GOMEMLIMIT: 200MiB
+    volumes:
+      - ./loki/loki.yaml:/etc/loki/loki.yaml:ro
+      - loki_data:/loki
+      - obs_hc_tools:/hc:ro
+    mem_limit: 256m
+    healthcheck:
+      test: ["CMD", "/hc/busybox", "wget", "-qO-", "http://127.0.0.1:3100/ready"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 20s
+    depends_on:
+      hc-tools:
+        condition: service_completed_successfully
+    logging: *default-logging
+
+  # Агент логов: читает stdout контейнеров ЭТОГО проекта через docker.sock и шлёт в Loki.
+  # Приложение не знает, куда уходят логи: оно пишет в stdout, остальное делает агент
+  alloy:
+    image: grafana/alloy:${ALLOY_VERSION:-v1.21.3}
+    profiles: [logs, observability]
+    restart: unless-stopped
+    command:
+      - run
+      - /etc/alloy/config.alloy
+      - --storage.path=/var/lib/alloy/data
+      - --server.http.listen-addr=0.0.0.0:12345
+      - --disable-reporting
+    environment:
+      # Фильтр discovery: только контейнеры с com.docker.compose.project=<имя проекта>
+      COMPOSE_PROJECT: mlops-phishing
+      # env для строк, где его нет в JSON (логи rabbitmq, postgres, mlflow…)
+      STACK_ENV: ${ENVIRONMENT:-development}
+      GOMEMLIMIT: 120MiB
+    volumes:
+      - ./alloy/config.alloy:/etc/alloy/config.alloy:ro
+      # Только чтение: агенту нужен список контейнеров и их логи, управлять Docker он не должен
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      # Позиции чтения: после рестарта агент не шлёт логи повторно и не теряет хвост
+      - alloy_data:/var/lib/alloy/data
+      - obs_hc_tools:/hc:ro
+    mem_limit: 160m
+    healthcheck:
+      test: ["CMD", "/hc/busybox", "wget", "-qO-", "http://127.0.0.1:12345/-/ready"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 10s
+    depends_on:
+      hc-tools:
+        condition: service_completed_successfully
+      loki:
+        condition: service_healthy
+    logging: *default-logging
+
+  # OTLP-шлюз: приложение шлёт трейсы и метрики сюда, а не в хранилища. Адрес хранилищ,
+  # батчинг, ретраи и защита по памяти — забота Collector, а не кода сервисов
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:${OTEL_COLLECTOR_VERSION:-0.164.0}
+    profiles: [traces, metrics, observability]
+    restart: unless-stopped
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
+    environment:
+      # Чуть выше limit_mib в memory_limiter: сначала отказывает лимитер, потом GC, OOM — никогда
+      GOMEMLIMIT: 130MiB
+    volumes:
+      - ./otel-collector.yaml:/etc/otelcol-contrib/config.yaml:ro
+      - obs_hc_tools:/hc:ro
+    mem_limit: 160m
+    healthcheck:
+      test: ["CMD", "/hc/busybox", "wget", "-qO-", "http://127.0.0.1:13133/"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 10s
+    depends_on:
+      hc-tools:
+        condition: service_completed_successfully
+    logging: *default-logging
+
+  # Хранилище трейсов. Ищет по trace_id и TraceQL, индекс не строит — дёшево по памяти
+  tempo:
+    image: grafana/tempo:${TEMPO_VERSION:-2.10.10}
+    profiles: [traces, observability]
+    restart: unless-stopped
+    command: ["-config.file=/etc/tempo/tempo.yaml"]
+    environment:
+      GOMEMLIMIT: 200MiB
+    volumes:
+      - ./tempo/tempo.yaml:/etc/tempo/tempo.yaml:ro
+      - tempo_data:/var/tempo
+      - obs_hc_tools:/hc:ro
+    mem_limit: 256m
+    healthcheck:
+      test: ["CMD", "/hc/busybox", "wget", "-qO-", "http://127.0.0.1:3200/ready"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 20s
+    depends_on:
+      hc-tools:
+        condition: service_completed_successfully
+    logging: *default-logging
+
+  # Хранилище метрик. Приложение пушит OTLP через Collector (источник короткоживущий — pull
+  # его не застанет), RabbitMQ Prometheus скрейпит сам (pull, плагин rabbitmq_prometheus)
+  prometheus:
+    image: prom/prometheus:${PROMETHEUS_VERSION:-v3.15.1}
+    profiles: [metrics, observability]
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      # Стенду хватает 2 дней: эксперимент длится минуты, а диск и память не бесконечны
+      - --storage.tsdb.retention.time=2d
+      - --storage.tsdb.retention.size=1GB
+      # Приём OTLP на /api/v1/otlp/v1/metrics — сюда пишет Collector
+      - --web.enable-otlp-receiver
+      # Exemplars: из точки гистограммы латентности — переход к трейсу медленного запроса
+      - --enable-feature=exemplar-storage
+      - --web.enable-lifecycle
+    environment:
+      GOMEMLIMIT: 200MiB
+    ports:
+      - "9090:9090" # PromQL-запросы на защите
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    mem_limit: 256m
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:9090/-/ready"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 15s
+    logging: *default-logging
+
+  # Витрина над тремя сигналами. Источники данных, дашборд и алерты — provisioning из
+  # репозитория: после down -v и up Grafana поднимается готовой, без кликов
+  grafana:
+    image: grafana/grafana:${GRAFANA_VERSION:-13.2.5}
+    profiles: [observability]
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      # Стенд: смотреть дашборд можно без логина, менять — только под админом
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /etc/grafana/dashboards/pipeline.json
+      # Стенд должен подниматься без интернета: никаких скачиваний плагинов и проверок версий
+      GF_PLUGINS_PREINSTALL_DISABLED: "true"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES: "false"
+      GF_NEWS_NEWS_FEED_ENABLED: "false"
+      GF_LOG_LEVEL: warn
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/etc/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    # Grafana 13 в простое уже ~250 MiB (alerting, поиск, плагины-приложения): 256 — впритык
+    mem_limit: 384m
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/api/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 30s
+    logging: *default-logging
+
+volumes:
+  obs_hc_tools:
+  loki_data:
+  alloy_data:
+  tempo_data:
+  prometheus_data:
+  grafana_data:

@@ -1,0 +1,5 @@
+# Плагины не нужны: Loki, Tempo и Prometheus — встроенные datasource Grafana.
+# Файл есть, чтобы Grafana не писала ошибку об отсутствующей папке provisioning/plugins.
+apiVersion: 1
+
+apps: []

@@ -1,0 +1,33 @@
+# Prometheus 3: метрики приложения приходят push'ем по OTLP (через Collector),
+# метрики очередей RabbitMQ — pull со встроенного плагина rabbitmq_prometheus.
+
+global:
+  # Эксперимент длится ~60 с: при 15 с по умолчанию на графике было бы 4 точки.
+  # 5 с — столько же, сколько OTEL_METRIC_EXPORT_INTERVAL у приложения
+  scrape_interval: 5s
+  scrape_timeout: 4s
+  evaluation_interval: 5s
+
+otlp:
+  # По умолчанию service.name → job, service.instance.id → instance (так различаются
+  # два воркера). Окружение из resource-атрибутов поднимаем в лейбл каждого ряда — одно
+  # значение на стенд, кардинальность не растёт. Остальное лежит в target_info.
+  promote_resource_attributes:
+    - deployment.environment.name
+    - service.version
+
+storage:
+  tsdb:
+    # Collector шлёт пачками и ретраит: точки могут прийти чуть не по порядку
+    out_of_order_time_window: 5m
+
+scrape_configs:
+  # Глубина очередей и неподтверждённые сообщения по каждой очереди. /metrics/detailed
+  # отдаёт только запрошенные семейства — без тысяч рядов /metrics/per-object
+  - job_name: rabbitmq
+    metrics_path: /metrics/detailed
+    params:
+      vhost: ["/"]
+      family: [queue_coarse_metrics, queue_consumer_count]
+    static_configs:
+      - targets: ["rabbitmq:15692"]
